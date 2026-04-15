@@ -1,0 +1,9 @@
+venv/
+__pycache__/
+*.pyc
+*.log
+strategy_positions.json
+signals_vps.json
+signals_vps_report.json
+.DS_Store
+timesfm_repo/
