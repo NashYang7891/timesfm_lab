@@ -88,7 +88,7 @@ MAX_TOTAL_MARGIN_RATIO = 0.5
 
 ATR_PERIOD = 14
 ATR_MULTIPLIER = 2.0
-TRAILING_STOP_TRIGGER_PCT = 0.5
+TRAILING_STOP_PCT = 2.0      # 跟踪止损回撤百分比 TRAILING_STOP_TRIGGER_PCT = 0.5
 
 # ==================== 3. Telegram推送 ====================
 def push_telegram(content):
@@ -679,7 +679,6 @@ class OKXTrader:
                             'open_margin': margin,
                             'open_nominal': contracts * open_price,
                             'stop_loss_price': None,
-                            'trailing_activated': False
                         }
                         self._save_strategy_positions()
                         log(f"🔄 接管孤儿持仓: {sym} {side.upper()} 已纳入管理")
@@ -913,9 +912,11 @@ class OKXTrader:
                             'open_price': actual_open_price,
                             'open_time': time.time(),
                             'open_qty': actual_filled,
-                            'open_margin': actual_margin,
+                            'open_margin': actual_used_margin,
                             'open_nominal': actual_nominal,
-                            'stop_loss_price': stop_loss_price,
+                            'stop_loss_price': stop_loss_price,           # ATR 初始止损价
+                            'highest_price': actual_open_price,          # 多单最高价（初始为开仓价）
+                            'lowest_price': actual_open_price            # 空单最低价（初始为开仓价）
                             'trailing_activated': False
                         }
                         self._save_strategy_positions()
@@ -1082,56 +1083,71 @@ class OKXTrader:
     def check_and_close_positions(self):
         closed_any = False
         try:
-            all_positions = self.exchange.fetch_positions()
+           all_positions = self.exchange.fetch_positions()
         except Exception as e:
-            err(f"获取持仓列表失败: {e}")
-            return False
+           err(f"获取持仓列表失败: {e}")
+           return False
         pos_map = {}
         for p in all_positions:
             contracts = float(p.get('contracts', 0))
             if contracts != 0:
-                pos_map[p['symbol']] = p
+            pos_map[p['symbol']] = p
         log(f"🔍 检查持仓: 策略持仓 {list(self.strategy_positions.keys())}, 交易所持仓 {list(pos_map.keys())}")
         self.sync_strategy_positions_with_exchange()
+    
         for sym, info in list(self.strategy_positions.items()):
-            if sym not in pos_map:
-                log(f"⚠️ 策略持仓 {sym} 未在交易所持仓中找到，可能已被平仓")
-                del self.strategy_positions[sym]
-                self._save_strategy_positions()
+        if sym not in pos_map:
+            log(f"⚠️ 策略持仓 {sym} 未在交易所持仓中找到，可能已被平仓")
+            del self.strategy_positions[sym]
+            self._save_strategy_positions()
+            continue
+        pos = pos_map[sym]
+        current_price = float(pos.get('last', 0))
+        if current_price == 0:
+            continue
+        
+        # 更新跟踪价格极值
+        if info['side'] == 'long':
+            if current_price > info.get('highest_price', info['open_price']):
+                info['highest_price'] = current_price
+            # 计算从最高价回撤的幅度
+            peak = info['highest_price']
+            drawdown_pct = (peak - current_price) / peak * 100
+            # 触发跟踪止损条件：回撤 >= TRAILING_STOP_PCT
+            if drawdown_pct >= TRAILING_STOP_PCT:
+                log(f"📉 触发跟踪止损: {sym} 多单，最高价 {peak:.4f}，当前价 {current_price:.4f}，回撤 {drawdown_pct:.2f}% >= {TRAILING_STOP_PCT}%")
+                self.close_position(sym, reason=f"跟踪止损（回撤 {drawdown_pct:.2f}%）")
+                closed_any = True
                 continue
-            pos = pos_map[sym]
-            current_price = float(pos.get('last', 0))
-            pnl_percent = float(pos.get('percentage', 0))
-            if abs(pnl_percent) < 1:
-                pnl_percent = pnl_percent * 100
-            hold_seconds = time.time() - info['open_time']
-            log(f"📉 检查持仓 {sym}: 盈亏 {pnl_percent:.2f}%, 持仓时长 {hold_seconds/60:.1f}分钟")
-            
-            if not info.get('trailing_activated', False):
-                if (info['side'] == 'long' and current_price >= info['open_price'] * (1 + TRAILING_STOP_TRIGGER_PCT/100)) or \
-                   (info['side'] == 'short' and current_price <= info['open_price'] * (1 - TRAILING_STOP_TRIGGER_PCT/100)):
-                    info['trailing_activated'] = True
-                    info['stop_loss_price'] = info['open_price']
-                    self._save_strategy_positions()
-                    log(f"📌 移动止损激活: {sym} 止损价移至保本 {info['open_price']:.4f}")
-                    push_telegram(f"📌 移动止损激活: {sym} 已保本，止损价 = 开仓价")
-            
-            stop_price = info.get('stop_loss_price')
-            if stop_price is not None:
-                if (info['side'] == 'long' and current_price <= stop_price) or (info['side'] == 'short' and current_price >= stop_price):
-                    log(f"💥 触发动态止损: {sym} 当前价 {current_price:.4f} 触及止损价 {stop_price:.4f}")
-                    self.close_position(sym, reason=f"动态止损 {stop_price:.4f}")
-                    closed_any = True
-                    continue
-            
-            #if pnl_percent >= TAKE_PROFIT_PCT:
-             #   log(f"🚀 触发止盈: {pnl_percent:.2f}% >= {TAKE_PROFIT_PCT}%")
-              #  self.close_position(sym, reason=f"止盈 {pnl_percent:.2f}% ≥ {TAKE_PROFIT_PCT}%")
-               # closed_any = True
-            #elif hold_seconds >= MAX_HOLD_SECONDS:
-             #   self.close_position(sym, reason=f"持仓超时 {hold_seconds/60:.1f}分钟 ≥ {MAX_HOLD_SECONDS/60}分钟")
-              #  closed_any = True
-        return closed_any
+        else:  # short
+            if current_price < info.get('lowest_price', info['open_price']):
+                info['lowest_price'] = current_price
+            # 计算从最低价反弹的幅度
+            trough = info['lowest_price']
+            bounce_pct = (current_price - trough) / trough * 100
+            if bounce_pct >= TRAILING_STOP_PCT:
+                log(f"📈 触发跟踪止损: {sym} 空单，最低价 {trough:.4f}，当前价 {current_price:.4f}，反弹 {bounce_pct:.2f}% >= {TRAILING_STOP_PCT}%")
+                self.close_position(sym, reason=f"跟踪止损（反弹 {bounce_pct:.2f}%）")
+                closed_any = True
+                continue
+        
+        # 检查 ATR 初始止损（如果还没被跟踪止损处理）
+        stop_price = info.get('stop_loss_price')
+        if stop_price is not None:
+            if (info['side'] == 'long' and current_price <= stop_price) or (info['side'] == 'short' and current_price >= stop_price):
+                log(f"💥 触发初始动态止损: {sym} 当前价 {current_price:.4f} 触及止损价 {stop_price:.4f}")
+                self.close_position(sym, reason=f"初始止损 {stop_price:.4f}")
+                closed_any = True
+                continue
+        
+        # 可选：打印当前状态
+        pnl_percent = float(pos.get('percentage', 0))
+        if abs(pnl_percent) < 1:
+            pnl_percent = pnl_percent * 100
+        hold_seconds = time.time() - info['open_time']
+        log(f"📉 检查持仓 {sym}: 盈亏 {pnl_percent:.2f}%, 持仓时长 {hold_seconds/60:.1f}分钟")
+        
+    return closed_any
 
     def check_manual_close(self):
         actual_positions = self.sync_positions()
