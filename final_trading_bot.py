@@ -1124,13 +1124,13 @@ class OKXTrader:
                     closed_any = True
                     continue
             
-            if pnl_percent >= TAKE_PROFIT_PCT:
-                log(f"🚀 触发止盈: {pnl_percent:.2f}% >= {TAKE_PROFIT_PCT}%")
-                self.close_position(sym, reason=f"止盈 {pnl_percent:.2f}% ≥ {TAKE_PROFIT_PCT}%")
-                closed_any = True
-            elif hold_seconds >= MAX_HOLD_SECONDS:
-                self.close_position(sym, reason=f"持仓超时 {hold_seconds/60:.1f}分钟 ≥ {MAX_HOLD_SECONDS/60}分钟")
-                closed_any = True
+            #if pnl_percent >= TAKE_PROFIT_PCT:
+             #   log(f"🚀 触发止盈: {pnl_percent:.2f}% >= {TAKE_PROFIT_PCT}%")
+              #  self.close_position(sym, reason=f"止盈 {pnl_percent:.2f}% ≥ {TAKE_PROFIT_PCT}%")
+               # closed_any = True
+            #elif hold_seconds >= MAX_HOLD_SECONDS:
+             #   self.close_position(sym, reason=f"持仓超时 {hold_seconds/60:.1f}分钟 ≥ {MAX_HOLD_SECONDS/60}分钟")
+              #  closed_any = True
         return closed_any
 
     def check_manual_close(self):
@@ -1271,25 +1271,27 @@ def main():
                 signals = run_prediction_cycle()
                 last_pred = now
 
-                if trader.strategy_positions:
-                    log("📢 平仓所有策略持仓，准备开新仓...")
-                    trader.close_all()
-                    time.sleep(2)
+                #if trader.strategy_positions:
+                 #   log("📢 平仓所有策略持仓，准备开新仓...")
+                  #  trader.close_all()
+                   # time.sleep(2)
 
                 trader.clear_pending_signals()
 
                 if signals and not has_set_pending_this_cycle:
-                    available_balance = trader.get_available_balance()
-                    open_amount = MAX_SINGLE_TRADE_USDT
-                    if available_balance < open_amount + 5:
-                        push_telegram(f"⚠️ 可用余额不足 {open_amount} USDT（可用: {available_balance:.2f}），无法开仓")
-                    else:
-                        trader.set_pending_signals(signals, open_amount)
-                        has_set_pending_this_cycle = True
-                        push_telegram(f"📋 已设置待开仓信号，将在价格满足条件时开仓，保证金: {open_amount:.2f} USDT/币")
-
-                equity = trader.get_account_equity()
-                push_telegram(f"💰 当前账户总权益: {equity:.2f} USDT")
+                   # 检查当前策略持仓数量
+                   current_positions_count = len(trader.strategy_positions)
+                   if current_positions_count >= MAX_CONCURRENT_POSITIONS:
+                   push_telegram(f"⚠️ 当前已有 {current_positions_count} 个策略持仓，达到上限 {MAX_CONCURRENT_POSITIONS}，本次信号暂不开仓")
+                   else:
+                       available_balance = trader.get_available_balance()
+                       open_amount = MAX_SINGLE_TRADE_USDT
+                       if available_balance < open_amount + 5:
+                          push_telegram(f"⚠️ 可用余额不足 {open_amount} USDT（可用: {available_balance:.2f}），无法开仓")
+                       else:
+                           trader.set_pending_signals(signals, open_amount)
+                           has_set_pending_this_cycle = True
+                           push_telegram(f"📋 已设置待开仓信号，将在价格满足条件时开仓，保证金: {open_amount:.2f} USDT/币")
 
             all_pos = trader.sync_positions()
             strategy_symbols = list(trader.strategy_positions.keys())
