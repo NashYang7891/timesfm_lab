@@ -238,59 +238,55 @@ def compute_macd(series, fast=12, slow=26, signal=9):
     hist_prev = histogram.iloc[-2] if len(histogram) >= 2 else histogram.iloc[-1]
     return macd_line.iloc[-1], signal_line.iloc[-1], histogram.iloc[-1], hist_prev
 
-def check_technical_indicators(symbol, side):
+def check_technical_indicators(symbol, side, current_price):
     try:
         df = fetch_klines_with_retry(symbol, BAR, 100)
         if df is None or len(df) < 60:
-            return True, "数据不足，跳过指标检查"
+            return True, f"数据不足，跳过指标检查 (当前价格: {current_price:.6f})"
         closes = df['c']
-        rsi = compute_rsi(closes, RSI_PERIOD)          # RSI_PERIOD 应设为 9
+        rsi = compute_rsi(closes, RSI_PERIOD)
         macd_line, signal_line, histogram, hist_prev = compute_macd(closes, MACD_FAST, MACD_SLOW, MACD_SIGNAL)
         
         MACD_HIST_EPSILON = 0.0005
         side_cn = "多单" if side == 'long' else "空单"
         
-        # RSI 条件（使用您调整后的阈值 35 和 65）
         if side == 'long':
-            if rsi >= RSI_LONG_THRESHOLD:   # RSI_LONG_THRESHOLD 应为 35
-                return False, f"{side_cn} RSI={rsi:.1f} ≥ {RSI_LONG_THRESHOLD}，不符合多单条件"
+            if rsi >= RSI_LONG_THRESHOLD:
+                return False, f"{side_cn} RSI={rsi:.1f} ≥ {RSI_LONG_THRESHOLD}，不符合多单条件 (当前价格: {current_price:.6f})"
         else:
-            if rsi <= RSI_SHORT_THRESHOLD:  # RSI_SHORT_THRESHOLD 应为 65
-                return False, f"{side_cn} RSI={rsi:.1f} ≤ {RSI_SHORT_THRESHOLD}，不符合空单条件"
+            if rsi <= RSI_SHORT_THRESHOLD:
+                return False, f"{side_cn} RSI={rsi:.1f} ≤ {RSI_SHORT_THRESHOLD}，不符合空单条件 (当前价格: {current_price:.6f})"
         
-        # MACD 柱状线动能（带容忍阈值）
         if side == 'long':
             if histogram <= -MACD_HIST_EPSILON:
-                return False, f"{side_cn} MACD柱状线={histogram:.4f} ≤ -{MACD_HIST_EPSILON}，动能过负"
+                return False, f"{side_cn} MACD柱状线={histogram:.4f} ≤ -{MACD_HIST_EPSILON}，动能过负 (当前价格: {current_price:.6f})"
         else:
             if histogram >= MACD_HIST_EPSILON:
-                return False, f"{side_cn} MACD柱状线={histogram:.4f} ≥ {MACD_HIST_EPSILON}，动能过正"
+                return False, f"{side_cn} MACD柱状线={histogram:.4f} ≥ {MACD_HIST_EPSILON}，动能过正 (当前价格: {current_price:.6f})"
         
-        # 零轴过滤
         if side == 'long':
             if macd_line <= 0 or signal_line <= 0:
-                return False, f"{side_cn} 快慢线不在零轴上方 (MACD={macd_line:.4f}, Signal={signal_line:.4f})"
+                return False, f"{side_cn} 快慢线不在零轴上方 (MACD={macd_line:.4f}, Signal={signal_line:.4f}) (当前价格: {current_price:.6f})"
         else:
             if macd_line >= 0 or signal_line >= 0:
-                return False, f"{side_cn} 快慢线不在零轴下方 (MACD={macd_line:.4f}, Signal={signal_line:.4f})"
+                return False, f"{side_cn} 快慢线不在零轴下方 (MACD={macd_line:.4f}, Signal={signal_line:.4f}) (当前价格: {current_price:.6f})"
         
-        # 多周期验证（15分钟）
         df_higher = fetch_klines_with_retry(symbol, HIGHER_BAR, 100)
         if df_higher is not None and len(df_higher) >= 30:
             closes_higher = df_higher['c']
             macd_higher, signal_higher, _, _ = compute_macd(closes_higher, MACD_FAST, MACD_SLOW, MACD_SIGNAL)
             if side == 'long':
                 if macd_higher <= signal_higher:
-                    return False, f"{side_cn} 15分钟MACD死叉 (MACD={macd_higher:.4f} ≤ Signal={signal_higher:.4f})，方向不符"
+                    return False, f"{side_cn} 15分钟MACD死叉 (MACD={macd_higher:.4f} ≤ Signal={signal_higher:.4f})，方向不符 (当前价格: {current_price:.6f})"
             else:
                 if macd_higher >= signal_higher:
-                    return False, f"{side_cn} 15分钟MACD金叉 (MACD={macd_higher:.4f} ≥ Signal={signal_higher:.4f})，方向不符"
+                    return False, f"{side_cn} 15分钟MACD金叉 (MACD={macd_higher:.4f} ≥ Signal={signal_higher:.4f})，方向不符 (当前价格: {current_price:.6f})"
         
         desc = f"RSI={rsi:.1f}, MACD={macd_line:.4f}, Signal={signal_line:.4f}, Hist={histogram:.4f}"
-        return True, f"技术指标通过: {desc}"
+        return True, f"技术指标通过: {desc} (当前价格: {current_price:.6f})"
     except Exception as e:
         err(f"技术指标计算异常 {symbol}: {e}")
-        return True, "指标计算异常，跳过检查"
+        return True, f"指标计算异常，跳过检查 (当前价格: {current_price:.6f})" 
 # ==================== 7. 预测评分 ====================
 def predict_and_score(instId):
     try:
@@ -334,20 +330,17 @@ def predict_and_score(instId):
 
         direction_confidence = 0.7 * consistency + 0.3 * max(0.0, min(1.0, r_squared))
 
-        # 提前确定信号方向，用于消息提示
         signal_side = "long" if expected_return > 0 else "short"
         side_text = "多单" if signal_side == "long" else "空单"
 
-        # 逐项检查并返回具体原因（包含方向）
         if abs(expected_return) < MIN_EXPECTED_RETURN:
-            return None, f"{side_text}预期收益 {expected_return*100:.2f}% (绝对值) < {MIN_EXPECTED_RETURN*100:.2f}%"
+            return None, f"{side_text}预期收益 {expected_return*100:.2f}% (绝对值) < {MIN_EXPECTED_RETURN*100:.2f}% (当前价格: {current_price:.6f})"
         if r_squared < MIN_R_SQUARED:
-            return None, f"{side_text}R² {r_squared:.3f} < {MIN_R_SQUARED}"
+            return None, f"{side_text}R² {r_squared:.3f} < {MIN_R_SQUARED} (当前价格: {current_price:.6f})"
         if direction_confidence < MIN_DIRECTION_CONFIDENCE:
-            return None, f"{side_text}方向置信度 {direction_confidence:.3f} < {MIN_DIRECTION_CONFIDENCE}"
+            return None, f"{side_text}方向置信度 {direction_confidence:.3f} < {MIN_DIRECTION_CONFIDENCE} (当前价格: {current_price:.6f})"
 
-        # 技术指标检查（函数内部已有方向相关的消息）
-        tech_ok, tech_msg = check_technical_indicators(instId, signal_side)
+        tech_ok, tech_msg = check_technical_indicators(instId, signal_side, current_price)
         if not tech_ok:
             return None, tech_msg
 
@@ -388,7 +381,7 @@ def predict_and_score(instId):
         }
         return result, ""
     except Exception as e:
-        return None, f"异常: {str(e)[:50]}"
+        return None, f"异常: {str(e)[:50]}" 
 # ==================== 8. 预测循环 ====================
 def run_prediction_cycle():
     now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
