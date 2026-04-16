@@ -37,7 +37,7 @@ err = logging.error
 # ==================== 2. 核心参数 ====================
 TG_BOT_TOKEN = "8722422674:AAGrKmRurQ2G__j-Vxbh5451v0e9_u97CQY"
 TG_CHAT_ID = "5372217316"
-TG_PROXIES = {"http": "http://127.0.0.1:10809", "https": "http://127.0.0.1:10809"}
+# 代理已移除，VPS 直连
 
 BAR = "3m"
 HIGHER_BAR = "15m"
@@ -88,15 +88,15 @@ MAX_TOTAL_MARGIN_RATIO = 0.5
 
 ATR_PERIOD = 14
 ATR_MULTIPLIER = 2.0
-TRAILING_STOP_PCT = 2.0      # 跟踪止损回撤百分比 TRAILING_STOP_TRIGGER_PCT = 0.5
+TRAILING_STOP_PCT = 2.0
 
-# ==================== 3. Telegram推送 ====================
+# ==================== 3. Telegram推送（无代理） ====================
 def push_telegram(content):
     if not TG_BOT_TOKEN: return False
     url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage"
     payload = {"chat_id": TG_CHAT_ID, "text": content, "disable_web_page_preview": True}
     try:
-        res = requests.post(url, json=payload, proxies=TG_PROXIES, timeout=8)
+        res = requests.post(url, json=payload, timeout=8)
         return res.json().get("ok")
     except:
         return False
@@ -136,12 +136,12 @@ def _build_timesfm_model():
 model = _build_timesfm_model()
 log("✅ 模型加载完成")
 
-# ==================== 5. OKX数据获取 ====================
+# ==================== 5. OKX数据获取（无代理） ====================
 def get_all_swap_contracts():
     try:
         url = "https://www.okx.com/api/v5/public/instruments"
         params = {"instType": "SWAP"}
-        data = requests.get(url, params=params, timeout=10, proxies=TG_PROXIES).json()["data"]
+        data = requests.get(url, params=params, timeout=10).json()["data"]
         symbols = []
         for item in data:
             if item["settleCcy"] == "USDT" and item["state"] == "live":
@@ -156,7 +156,7 @@ def fetch_klines_with_retry(instId, bar, limit, max_retries=3):
     params = {"instId": instId, "bar": bar, "limit": str(limit)}
     for attempt in range(max_retries):
         try:
-            res = requests.get(url, params=params, timeout=10, proxies=TG_PROXIES)
+            res = requests.get(url, params=params, timeout=10)
             data = res.json()
             if data.get("code") == "0" and data.get("data"):
                 df = pd.DataFrame(data["data"], columns=["ts", "o", "h", "l", "c", "v", "vc", "cv", "confirm"])
@@ -191,7 +191,7 @@ def fetch_volume_usdt(instId):
     try:
         url = "https://www.okx.com/api/v5/market/ticker"
         params = {"instId": instId}
-        res = requests.get(url, params=params, timeout=5, proxies=TG_PROXIES).json()
+        res = requests.get(url, params=params, timeout=5).json()
         if res.get("code") == "0" and res.get("data"):
             vol_usdt = float(res["data"][0].get("volCcy24h", 0))
             return vol_usdt
@@ -203,11 +203,11 @@ def fetch_market_cap(instId):
     try:
         base = instId.split('-')[0]
         search_url = f"https://api.coingecko.com/api/v3/search?query={base}"
-        resp = requests.get(search_url, timeout=5, proxies=TG_PROXIES).json()
+        resp = requests.get(search_url, timeout=5).json()
         if resp.get('coins'):
             coin_id = resp['coins'][0]['id']
             coin_url = f"https://api.coingecko.com/api/v3/coins/{coin_id}"
-            coin_data = requests.get(coin_url, timeout=5, proxies=TG_PROXIES).json()
+            coin_data = requests.get(coin_url, timeout=5).json()
             market_cap = coin_data.get('market_data', {}).get('market_cap', {}).get('usd', 0)
             return market_cap
         return 0
@@ -246,31 +246,31 @@ def check_technical_indicators(symbol, side, current_price):
         closes = df['c']
         rsi = compute_rsi(closes, RSI_PERIOD)
         macd_line, signal_line, histogram, hist_prev = compute_macd(closes, MACD_FAST, MACD_SLOW, MACD_SIGNAL)
-        
+
         MACD_HIST_EPSILON = 0.0005
         side_cn = "多单" if side == 'long' else "空单"
-        
+
         if side == 'long':
             if rsi >= RSI_LONG_THRESHOLD:
                 return False, f"{side_cn} RSI={rsi:.1f} ≥ {RSI_LONG_THRESHOLD}，不符合多单条件 (当前价格: {current_price:.6f})"
         else:
             if rsi <= RSI_SHORT_THRESHOLD:
                 return False, f"{side_cn} RSI={rsi:.1f} ≤ {RSI_SHORT_THRESHOLD}，不符合空单条件 (当前价格: {current_price:.6f})"
-        
+
         if side == 'long':
             if histogram <= -MACD_HIST_EPSILON:
                 return False, f"{side_cn} MACD柱状线={histogram:.4f} ≤ -{MACD_HIST_EPSILON}，动能过负 (当前价格: {current_price:.6f})"
         else:
             if histogram >= MACD_HIST_EPSILON:
                 return False, f"{side_cn} MACD柱状线={histogram:.4f} ≥ {MACD_HIST_EPSILON}，动能过正 (当前价格: {current_price:.6f})"
-        
+
         if side == 'long':
             if macd_line <= 0 or signal_line <= 0:
                 return False, f"{side_cn} 快慢线不在零轴上方 (MACD={macd_line:.4f}, Signal={signal_line:.4f}) (当前价格: {current_price:.6f})"
         else:
             if macd_line >= 0 or signal_line >= 0:
                 return False, f"{side_cn} 快慢线不在零轴下方 (MACD={macd_line:.4f}, Signal={signal_line:.4f}) (当前价格: {current_price:.6f})"
-        
+
         df_higher = fetch_klines_with_retry(symbol, HIGHER_BAR, 100)
         if df_higher is not None and len(df_higher) >= 30:
             closes_higher = df_higher['c']
@@ -281,12 +281,13 @@ def check_technical_indicators(symbol, side, current_price):
             else:
                 if macd_higher >= signal_higher:
                     return False, f"{side_cn} 15分钟MACD金叉 (MACD={macd_higher:.4f} ≥ Signal={signal_higher:.4f})，方向不符 (当前价格: {current_price:.6f})"
-        
+
         desc = f"RSI={rsi:.1f}, MACD={macd_line:.4f}, Signal={signal_line:.4f}, Hist={histogram:.4f}"
         return True, f"技术指标通过: {desc} (当前价格: {current_price:.6f})"
     except Exception as e:
         err(f"技术指标计算异常 {symbol}: {e}")
-        return True, f"指标计算异常，跳过检查 (当前价格: {current_price:.6f})" 
+        return True, f"指标计算异常，跳过检查 (当前价格: {current_price:.6f})"
+
 # ==================== 7. 预测评分 ====================
 def predict_and_score(instId):
     try:
@@ -381,7 +382,8 @@ def predict_and_score(instId):
         }
         return result, ""
     except Exception as e:
-        return None, f"异常: {str(e)[:50]}" 
+        return None, f"异常: {str(e)[:50]}"
+
 # ==================== 8. 预测循环 ====================
 def run_prediction_cycle():
     now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -458,7 +460,6 @@ def run_prediction_cycle():
         else:
             filtered_reasons.append(f"{s}: {reason}")
             log(f"  {s} 过滤: {reason}")
-            # 不再逐条推送 Telegram，避免刷屏
 
     if not valid:
         log("❌ 无符合条件信号")
@@ -503,7 +504,7 @@ def run_prediction_cycle():
         json.dump(output_dict, f, indent=2, ensure_ascii=False)
     return output_dict
 
-# ==================== 9. 交易模块（修复版） ====================
+# ==================== 9. 交易模块（修复版，无代理） ====================
 class OKXTrader:
     def __init__(self):
         self.exchange = self._init()
@@ -556,16 +557,12 @@ class OKXTrader:
 
     def _init(self):
         log("🚀 初始化OKX交易客户端...")
-        proxy = TG_PROXIES.get("http") if TG_PROXIES else "http://127.0.0.1:10809"
-        proxies = {"http": proxy, "https": proxy}
-
         ex = ccxt.okx({
             "apiKey": API_KEY,
             "secret": API_SECRET,
             "password": API_PASS,
             "enableRateLimit": True,
             "timeout": 30000,
-            "proxies": proxies,
             "options": {"defaultType": "swap"}
         })
         ex.set_sandbox_mode(IS_SANDBOX)
@@ -704,7 +701,7 @@ class OKXTrader:
                 'Content-Type': 'application/json'
             }
             url = "https://www.okx.com" + request_path
-            response = requests.post(url, headers=headers, data=body_json, proxies=TG_PROXIES, timeout=5)
+            response = requests.post(url, headers=headers, data=body_json, timeout=5)
             result = response.json()
             if result.get('code') == '0':
                 log(f"设置杠杆 {symbol} {leverage}x 逐仓成功")
@@ -905,11 +902,11 @@ class OKXTrader:
                             'open_price': actual_open_price,
                             'open_time': time.time(),
                             'open_qty': actual_filled,
-                            'open_margin': actual_used_margin,
+                            'open_margin': actual_margin,
                             'open_nominal': actual_nominal,
-                            'stop_loss_price': stop_loss_price,           # ATR 初始止损价
-                            'highest_price': actual_open_price,          # 多单最高价（初始为开仓价）
-                            'lowest_price': actual_open_price            # 空单最低价（初始为开仓价）
+                            'stop_loss_price': stop_loss_price,
+                            'highest_price': actual_open_price,
+                            'lowest_price': actual_open_price,
                             'trailing_activated': False
                         }
                         self._save_strategy_positions()
@@ -1076,71 +1073,71 @@ class OKXTrader:
     def check_and_close_positions(self):
         closed_any = False
         try:
-           all_positions = self.exchange.fetch_positions()
+            all_positions = self.exchange.fetch_positions()
         except Exception as e:
-           err(f"获取持仓列表失败: {e}")
-           return False
+            err(f"获取持仓列表失败: {e}")
+            return False
         pos_map = {}
         for p in all_positions:
             contracts = float(p.get('contracts', 0))
             if contracts != 0:
-            pos_map[p['symbol']] = p
+                pos_map[p['symbol']] = p
         log(f"🔍 检查持仓: 策略持仓 {list(self.strategy_positions.keys())}, 交易所持仓 {list(pos_map.keys())}")
         self.sync_strategy_positions_with_exchange()
-    
+
         for sym, info in list(self.strategy_positions.items()):
-        if sym not in pos_map:
-            log(f"⚠️ 策略持仓 {sym} 未在交易所持仓中找到，可能已被平仓")
-            del self.strategy_positions[sym]
-            self._save_strategy_positions()
-            continue
-        pos = pos_map[sym]
-        current_price = float(pos.get('last', 0))
-        if current_price == 0:
-            continue
-        
-        # 更新跟踪价格极值
-        if info['side'] == 'long':
-            if current_price > info.get('highest_price', info['open_price']):
-                info['highest_price'] = current_price
-            # 计算从最高价回撤的幅度
-            peak = info['highest_price']
-            drawdown_pct = (peak - current_price) / peak * 100
-            # 触发跟踪止损条件：回撤 >= TRAILING_STOP_PCT
-            if drawdown_pct >= TRAILING_STOP_PCT:
-                log(f"📉 触发跟踪止损: {sym} 多单，最高价 {peak:.4f}，当前价 {current_price:.4f}，回撤 {drawdown_pct:.2f}% >= {TRAILING_STOP_PCT}%")
-                self.close_position(sym, reason=f"跟踪止损（回撤 {drawdown_pct:.2f}%）")
-                closed_any = True
+            if sym not in pos_map:
+                log(f"⚠️ 策略持仓 {sym} 未在交易所持仓中找到，可能已被平仓")
+                del self.strategy_positions[sym]
+                self._save_strategy_positions()
                 continue
-        else:  # short
-            if current_price < info.get('lowest_price', info['open_price']):
-                info['lowest_price'] = current_price
-            # 计算从最低价反弹的幅度
-            trough = info['lowest_price']
-            bounce_pct = (current_price - trough) / trough * 100
-            if bounce_pct >= TRAILING_STOP_PCT:
-                log(f"📈 触发跟踪止损: {sym} 空单，最低价 {trough:.4f}，当前价 {current_price:.4f}，反弹 {bounce_pct:.2f}% >= {TRAILING_STOP_PCT}%")
-                self.close_position(sym, reason=f"跟踪止损（反弹 {bounce_pct:.2f}%）")
-                closed_any = True
+            pos = pos_map[sym]
+            current_price = float(pos.get('last', 0))
+            if current_price == 0:
                 continue
-        
-        # 检查 ATR 初始止损（如果还没被跟踪止损处理）
-        stop_price = info.get('stop_loss_price')
-        if stop_price is not None:
-            if (info['side'] == 'long' and current_price <= stop_price) or (info['side'] == 'short' and current_price >= stop_price):
-                log(f"💥 触发初始动态止损: {sym} 当前价 {current_price:.4f} 触及止损价 {stop_price:.4f}")
-                self.close_position(sym, reason=f"初始止损 {stop_price:.4f}")
-                closed_any = True
-                continue
-        
-        # 可选：打印当前状态
-        pnl_percent = float(pos.get('percentage', 0))
-        if abs(pnl_percent) < 1:
-            pnl_percent = pnl_percent * 100
-        hold_seconds = time.time() - info['open_time']
-        log(f"📉 检查持仓 {sym}: 盈亏 {pnl_percent:.2f}%, 持仓时长 {hold_seconds/60:.1f}分钟")
-        
-    return closed_any
+
+            # 更新跟踪价格极值
+            if info['side'] == 'long':
+                if current_price > info.get('highest_price', info['open_price']):
+                    info['highest_price'] = current_price
+                # 计算从最高价回撤的幅度
+                peak = info['highest_price']
+                drawdown_pct = (peak - current_price) / peak * 100
+                # 触发跟踪止损条件：回撤 >= TRAILING_STOP_PCT
+                if drawdown_pct >= TRAILING_STOP_PCT:
+                    log(f"📉 触发跟踪止损: {sym} 多单，最高价 {peak:.4f}，当前价 {current_price:.4f}，回撤 {drawdown_pct:.2f}% >= {TRAILING_STOP_PCT}%")
+                    self.close_position(sym, reason=f"跟踪止损（回撤 {drawdown_pct:.2f}%）")
+                    closed_any = True
+                    continue
+            else:  # short
+                if current_price < info.get('lowest_price', info['open_price']):
+                    info['lowest_price'] = current_price
+                # 计算从最低价反弹的幅度
+                trough = info['lowest_price']
+                bounce_pct = (current_price - trough) / trough * 100
+                if bounce_pct >= TRAILING_STOP_PCT:
+                    log(f"📈 触发跟踪止损: {sym} 空单，最低价 {trough:.4f}，当前价 {current_price:.4f}，反弹 {bounce_pct:.2f}% >= {TRAILING_STOP_PCT}%")
+                    self.close_position(sym, reason=f"跟踪止损（反弹 {bounce_pct:.2f}%）")
+                    closed_any = True
+                    continue
+
+            # 检查 ATR 初始止损（如果还没被跟踪止损处理）
+            stop_price = info.get('stop_loss_price')
+            if stop_price is not None:
+                if (info['side'] == 'long' and current_price <= stop_price) or (info['side'] == 'short' and current_price >= stop_price):
+                    log(f"💥 触发初始动态止损: {sym} 当前价 {current_price:.4f} 触及止损价 {stop_price:.4f}")
+                    self.close_position(sym, reason=f"初始止损 {stop_price:.4f}")
+                    closed_any = True
+                    continue
+
+            # 可选：打印当前状态
+            pnl_percent = float(pos.get('percentage', 0))
+            if abs(pnl_percent) < 1:
+                pnl_percent = pnl_percent * 100
+            hold_seconds = time.time() - info['open_time']
+            log(f"📉 检查持仓 {sym}: 盈亏 {pnl_percent:.2f}%, 持仓时长 {hold_seconds/60:.1f}分钟")
+
+        return closed_any
 
     def check_manual_close(self):
         actual_positions = self.sync_positions()
@@ -1280,27 +1277,21 @@ def main():
                 signals = run_prediction_cycle()
                 last_pred = now
 
-                #if trader.strategy_positions:
-                 #   log("📢 平仓所有策略持仓，准备开新仓...")
-                  #  trader.close_all()
-                   # time.sleep(2)
-
                 trader.clear_pending_signals()
 
                 if signals and not has_set_pending_this_cycle:
-                   # 检查当前策略持仓数量
-                   current_positions_count = len(trader.strategy_positions)
-                   if current_positions_count >= MAX_CONCURRENT_POSITIONS:
-                   push_telegram(f"⚠️ 当前已有 {current_positions_count} 个策略持仓，达到上限 {MAX_CONCURRENT_POSITIONS}，本次信号暂不开仓")
-                   else:
-                       available_balance = trader.get_available_balance()
-                       open_amount = MAX_SINGLE_TRADE_USDT
-                       if available_balance < open_amount + 5:
-                          push_telegram(f"⚠️ 可用余额不足 {open_amount} USDT（可用: {available_balance:.2f}），无法开仓")
-                       else:
-                           trader.set_pending_signals(signals, open_amount)
-                           has_set_pending_this_cycle = True
-                           push_telegram(f"📋 已设置待开仓信号，将在价格满足条件时开仓，保证金: {open_amount:.2f} USDT/币")
+                    current_positions_count = len(trader.strategy_positions)
+                    if current_positions_count >= MAX_CONCURRENT_POSITIONS:
+                        push_telegram(f"⚠️ 当前已有 {current_positions_count} 个策略持仓，达到上限 {MAX_CONCURRENT_POSITIONS}，本次信号暂不开仓")
+                    else:
+                        available_balance = trader.get_available_balance()
+                        open_amount = MAX_SINGLE_TRADE_USDT
+                        if available_balance < open_amount + 5:
+                            push_telegram(f"⚠️ 可用余额不足 {open_amount} USDT（可用: {available_balance:.2f}），无法开仓")
+                        else:
+                            trader.set_pending_signals(signals, open_amount)
+                            has_set_pending_this_cycle = True
+                            push_telegram(f"📋 已设置待开仓信号，将在价格满足条件时开仓，保证金: {open_amount:.2f} USDT/币")
 
             all_pos = trader.sync_positions()
             strategy_symbols = list(trader.strategy_positions.keys())
