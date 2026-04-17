@@ -22,7 +22,7 @@ if sys.stdout.encoding != 'utf-8':
     sys.stdout.reconfigure(encoding='utf-8')
 
 warnings.filterwarnings('ignore')
-log_dir = "/home/apt/timesfm_lab"
+log_dir = "/root/timesfm_lab"
 if not os.path.exists(log_dir): os.makedirs(log_dir)
 
 logging.basicConfig(
@@ -34,28 +34,28 @@ logging.basicConfig(
 log = logging.info
 err = logging.error
 
-# ==================== 2. 核心参数（优化版） ====================
+# ==================== 2. 核心参数（优化版，无代理） ====================
 TG_BOT_TOKEN = "8722422674:AAGrKmRurQ2G__j-Vxbh5451v0e9_u97CQY"
 TG_CHAT_ID = "5372217316"
-TG_PROXIES = {"http": "http://127.0.0.1:10809", "https": "http://127.0.0.1:10809"}
+TG_PROXIES = None                     # VPS 上不需要代理
 
 BAR = "3m"
 HIGHER_BAR = "15m"
 LIMIT = 900
-HORIZON = 7
+HORIZON = 4                           # 预测4步 = 12分钟
 
 TOP_N = 50
 FINAL_PICK_N = 2
-MIN_EXPECTED_RETURN = 0.006           # 0.6% (原0.03%，大幅提高)
-MIN_R_SQUARED = 0.3                   # 原0.5，降低以适应行情突变
+MIN_EXPECTED_RETURN = 0.006           # 0.6%
+MIN_R_SQUARED = 0.2                   # 降低到0.2
 MIN_DIRECTION_CONFIDENCE = 0.65
 
-RSI_PERIOD = 9
-MACD_FAST = 5                         # 原8
-MACD_SLOW = 13                        # 原21
-MACD_SIGNAL = 3                       # 原5
-RSI_LONG_THRESHOLD = 50               # 原35，放宽多单RSI上限
-RSI_SHORT_THRESHOLD = 80              # 原65，提高空单RSI下限
+RSI_PERIOD = 7                        # 从9缩短到7
+MACD_FAST = 5
+MACD_SLOW = 13
+MACD_SIGNAL = 3
+RSI_LONG_THRESHOLD = 45               # 从35提高到45
+RSI_SHORT_THRESHOLD = 75              # 从65提高到75
 
 OUTPUT_FILE = f"{log_dir}/signals_vps.json"
 REPORT_FILE = f"{log_dir}/signals_vps_report.json"
@@ -92,7 +92,7 @@ TRAILING_STOP_PCT = 2.0
 
 # 新增参数
 VOLUME_SPIKE_RATIO = 2.5              # 成交量突增倍数
-MIN_ATR_VALUE = 0.0005                # 最小ATR绝对值，低于此值不开仓
+MIN_ATR_VALUE = 0.0005                # 最小ATR绝对值
 EMERGENCY_MOVE_PCT = 1.5              # 紧急动能阈值（%）
 
 # ==================== 3. Telegram推送 ====================
@@ -101,7 +101,7 @@ def push_telegram(content):
     url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage"
     payload = {"chat_id": TG_CHAT_ID, "text": content, "disable_web_page_preview": True}
     try:
-        res = requests.post(url, json=payload, proxies=TG_PROXIES, timeout=8)
+        res = requests.post(url, json=payload, timeout=8)
         return res.json().get("ok")
     except:
         return False
@@ -146,7 +146,7 @@ def get_all_swap_contracts():
     try:
         url = "https://www.okx.com/api/v5/public/instruments"
         params = {"instType": "SWAP"}
-        data = requests.get(url, params=params, timeout=10, proxies=TG_PROXIES).json()["data"]
+        data = requests.get(url, params=params, timeout=10).json()["data"]
         symbols = []
         for item in data:
             if item["settleCcy"] == "USDT" and item["state"] == "live":
@@ -161,7 +161,7 @@ def fetch_klines_with_retry(instId, bar, limit, max_retries=3):
     params = {"instId": instId, "bar": bar, "limit": str(limit)}
     for attempt in range(max_retries):
         try:
-            res = requests.get(url, params=params, timeout=10, proxies=TG_PROXIES)
+            res = requests.get(url, params=params, timeout=10)
             data = res.json()
             if data.get("code") == "0" and data.get("data"):
                 df = pd.DataFrame(data["data"], columns=["ts", "o", "h", "l", "c", "v", "vc", "cv", "confirm"])
@@ -197,7 +197,7 @@ def fetch_volume_usdt(instId):
     try:
         url = "https://www.okx.com/api/v5/market/ticker"
         params = {"instId": instId}
-        res = requests.get(url, params=params, timeout=5, proxies=TG_PROXIES).json()
+        res = requests.get(url, params=params, timeout=5).json()
         if res.get("code") == "0" and res.get("data"):
             vol_usdt = float(res["data"][0].get("volCcy24h", 0))
             return vol_usdt
@@ -209,11 +209,11 @@ def fetch_market_cap(instId):
     try:
         base = instId.split('-')[0]
         search_url = f"https://api.coingecko.com/api/v3/search?query={base}"
-        resp = requests.get(search_url, timeout=5, proxies=TG_PROXIES).json()
+        resp = requests.get(search_url, timeout=5).json()
         if resp.get('coins'):
             coin_id = resp['coins'][0]['id']
             coin_url = f"https://api.coingecko.com/api/v3/coins/{coin_id}"
-            coin_data = requests.get(coin_url, timeout=5, proxies=TG_PROXIES).json()
+            coin_data = requests.get(coin_url, timeout=5).json()
             market_cap = coin_data.get('market_data', {}).get('market_cap', {}).get('usd', 0)
             return market_cap
         return 0
@@ -253,29 +253,21 @@ def calculate_bollinger_bandwidth(series, period=20, std=2):
     return bandwidth.iloc[-1] if not bandwidth.empty else 1.0
 
 def check_momentum_surge(symbol, current_price, side):
-    """
-    检测成交量与价格实体是否出现爆发式增长
-    返回 (是否突变, 突变强度因子 1~3)
-    """
+    """检测成交量与价格实体是否出现爆发式增长"""
     try:
         df = fetch_klines_with_retry(symbol, BAR, 30)
         if df is None or len(df) < 25:
             return False, 1.0
-        # 最近20根已收盘K线
         closes = df['c'].iloc[-21:-1]
         volumes = df['v'].iloc[-21:-1].astype(float)
         bodies = (df['c'] - df['o']).abs().iloc[-21:-1]
         avg_volume = volumes.mean()
         avg_body = bodies.mean()
-        # 当前K线（最近一根）
         current_volume = float(df['v'].iloc[-1])
         current_body = abs(float(df['c'].iloc[-1]) - float(df['o'].iloc[-1]))
-        # 价格变动方向
         prev_close = float(df['c'].iloc[-2])
         price_change_pct = (current_price - prev_close) / prev_close * 100
-        # 成交量突增且价格方向与信号方向一致
         if current_volume > avg_volume * VOLUME_SPIKE_RATIO and current_body > avg_body * 1.5:
-            # 检查方向一致性
             if (side == 'long' and price_change_pct > 0) or (side == 'short' and price_change_pct < 0):
                 vol_ratio = min(current_volume / avg_volume, 10) / 3.33
                 body_ratio = min(current_body / avg_body, 5) / 1.67
@@ -299,7 +291,6 @@ def check_emergency_move(symbol, current_price):
         return False, 0.0
 
 def check_technical_indicators(symbol, side, current_price, atr):
-    # 增加 atr 参数，用于过滤低波动
     try:
         df = fetch_klines_with_retry(symbol, BAR, 100)
         if df is None or len(df) < 60:
@@ -311,25 +302,20 @@ def check_technical_indicators(symbol, side, current_price, atr):
         MACD_HIST_EPSILON = 0.0005
         side_cn = "多单" if side == 'long' else "空单"
 
-        # 1. 检测动能突变
         is_surge, surge_factor = check_momentum_surge(symbol, current_price, side)
         emergency, move_pct = check_emergency_move(symbol, current_price)
 
-        # 如果发生紧急大幅变动，直接放行（不再检查RSI、MACD柱状线等）
         if emergency:
             log(f"🚨 紧急动能信号: {symbol} {side_cn} 价格变动 {move_pct:.1f}% >= {EMERGENCY_MOVE_PCT}%")
             return True, f"紧急动能信号 (变动 {move_pct:.1f}%)", surge_factor
 
-        # 2. 正常情况下的技术指标检查（但若发生成交量突变，可降低阈值）
-        effective_rsi_thresh = RSI_LONG_THRESHOLD if side == 'long' else RSI_SHORT_THRESHOLD
         if side == 'long':
-            if rsi >= effective_rsi_thresh and not is_surge:
-                return False, f"{side_cn} RSI={rsi:.1f} ≥ {effective_rsi_thresh}，不符合多单条件", 1.0
+            if rsi >= RSI_LONG_THRESHOLD and not is_surge:
+                return False, f"{side_cn} RSI={rsi:.1f} ≥ {RSI_LONG_THRESHOLD}，不符合多单条件", 1.0
         else:
-            if rsi <= effective_rsi_thresh and not is_surge:
-                return False, f"{side_cn} RSI={rsi:.1f} ≤ {effective_rsi_thresh}，不符合空单条件", 1.0
+            if rsi <= RSI_SHORT_THRESHOLD and not is_surge:
+                return False, f"{side_cn} RSI={rsi:.1f} ≤ {RSI_SHORT_THRESHOLD}，不符合空单条件", 1.0
 
-        # MACD柱状线条件（若为动能突变，放宽至只检查正负方向，不检查绝对值）
         if side == 'long':
             if histogram <= -MACD_HIST_EPSILON and not is_surge:
                 return False, f"{side_cn} MACD柱状线={histogram:.4f} ≤ -{MACD_HIST_EPSILON}，动能过负", 1.0
@@ -337,10 +323,8 @@ def check_technical_indicators(symbol, side, current_price, atr):
             if histogram >= MACD_HIST_EPSILON and not is_surge:
                 return False, f"{side_cn} MACD柱状线={histogram:.4f} ≥ {MACD_HIST_EPSILON}，动能过正", 1.0
 
-        # 零轴过滤
         if side == 'long':
             if macd_line <= 0 or signal_line <= 0:
-                # 如果发生成交量突变，允许零轴下方开多（因为可能是V型反转）
                 if not is_surge:
                     return False, f"{side_cn} 快慢线不在零轴上方 (MACD={macd_line:.4f}, Signal={signal_line:.4f})", 1.0
         else:
@@ -348,7 +332,6 @@ def check_technical_indicators(symbol, side, current_price, atr):
                 if not is_surge:
                     return False, f"{side_cn} 快慢线不在零轴下方 (MACD={macd_line:.4f}, Signal={signal_line:.4f})", 1.0
 
-        # 多周期验证（15分钟）
         df_higher = fetch_klines_with_retry(symbol, HIGHER_BAR, 100)
         if df_higher is not None and len(df_higher) >= 30:
             closes_higher = df_higher['c']
@@ -360,7 +343,6 @@ def check_technical_indicators(symbol, side, current_price, atr):
                 if macd_higher >= signal_higher and not is_surge:
                     return False, f"{side_cn} 15分钟MACD金叉 (MACD={macd_higher:.4f} ≥ Signal={signal_higher:.4f})，方向不符", 1.0
 
-        # 3. ATR 波动率过滤（低波动不开仓）
         if atr is not None and atr < MIN_ATR_VALUE and not is_surge and not emergency:
             return False, f"ATR={atr:.6f} < {MIN_ATR_VALUE}，波动率过低", 1.0
 
@@ -416,16 +398,7 @@ def predict_and_score(instId):
         signal_side = "long" if expected_return > 0 else "short"
         side_text = "多单" if signal_side == "long" else "空单"
 
-        # 获取当前ATR用于波动率判断
-        atr = None
-        try:
-            # 临时获取ATR（用于过滤）
-            ticker = None  # 占位，实际需要获取ATR，但为了方便，我们可以在后面调用 get_atr 方法
-            # 由于在预测函数中无法直接调用 OKXTrader 实例，我们单独实现一个简单的ATR计算函数
-        except:
-            pass
-
-        # 模拟获取ATR（实际应该调用函数，但为了避免循环依赖，我们在这里快速实现）
+        # 快速计算ATR用于波动率判断
         def quick_atr(symbol, period=14):
             df_atr = fetch_klines_with_retry(symbol, BAR, period+1)
             if df_atr is None or len(df_atr) < period+1:
@@ -439,17 +412,13 @@ def predict_and_score(instId):
             return np.mean(tr[-period:])
 
         atr = quick_atr(instId, ATR_PERIOD)
-
-        # 检查是否紧急变动
         emergency, move_pct = check_emergency_move(instId, current_price)
 
-        # 临时调整 R² 阈值（如果紧急变动或成交量突变，则降低要求）
         effective_min_r2 = MIN_R_SQUARED
         is_surge, _ = check_momentum_surge(instId, current_price, signal_side)
         if emergency or is_surge:
-            effective_min_r2 = 0.2   # 放宽到0.2
+            effective_min_r2 = 0.2
 
-        # 预期收益阈值检查（绝对值）
         if abs(expected_return) < MIN_EXPECTED_RETURN:
             return None, f"{side_text}预期收益 {expected_return*100:.2f}% (绝对值) < {MIN_EXPECTED_RETURN*100:.2f}% (当前价格: {current_price:.6f})"
         if r_squared < effective_min_r2:
@@ -457,18 +426,16 @@ def predict_and_score(instId):
         if direction_confidence < MIN_DIRECTION_CONFIDENCE:
             return None, f"{side_text}方向置信度 {direction_confidence:.3f} < {MIN_DIRECTION_CONFIDENCE} (当前价格: {current_price:.6f})"
 
-        # 技术指标检查（传入 atr）
         tech_ok, tech_msg, surge_factor = check_technical_indicators(instId, signal_side, current_price, atr)
         if not tech_ok:
             return None, tech_msg
 
         # ========== 重构得分算法 ==========
-        # 基础分（原有得分）
+        # 基础分
         base_score = abs(expected_return) * 100 * 0.4 + r_squared * 0.3 + consistency * 0.3
-        # 归一化基础分（0~1）
-        base_score = min(1.0, base_score / 2.0)   # 粗略归一化
+        base_score = min(1.0, base_score / 2.0)
 
-        # 趋势分：计算价格相对于20周期EMA的位置
+        # 趋势分：基于价格相对于20周期EMA
         try:
             df_trend = fetch_klines_with_retry(instId, BAR, 30)
             if df_trend is not None and len(df_trend) >= 20:
@@ -485,8 +452,6 @@ def predict_and_score(instId):
             trend_score = 0.5
 
         # 动能分：成交量突变强度 + 价格突破强度
-        # 成交量突变强度 surge_factor 已经在上面计算
-        # 价格突破强度：检测是否突破前5根K线的高低点
         try:
             df_break = fetch_klines_with_retry(instId, BAR, 10)
             if df_break is not None and len(df_break) >= 6:
@@ -503,18 +468,14 @@ def predict_and_score(instId):
         except:
             break_score = 0.0
 
-        # 动能分 = 突变强度 * 0.7 + 突破分 * 0.3
         momentum_score = surge_factor * 0.7 + break_score * 0.3
         momentum_score = min(1.0, momentum_score)
 
-        # 最终得分：基础分40% + 趋势分30% + 动能分30%
         final_score = base_score * 0.4 + trend_score * 0.3 + momentum_score * 0.3
-
-        # 对得分进行修饰：如果紧急变动，额外加分
         if emergency:
             final_score = min(1.0, final_score * 1.2)
 
-        score = final_score * 100   # 转换为百分制，与原来一致
+        score = final_score * 100
 
         candle = fetch_previous_candle(instId)
         if candle is None:
@@ -673,11 +634,8 @@ def run_prediction_cycle():
         json.dump(output_dict, f, indent=2, ensure_ascii=False)
     return output_dict
 
-# ==================== 9. 交易模块（修复缩进和入场逻辑） ====================
+# ==================== 9. 交易模块（无代理，修复缩进） ====================
 class OKXTrader:
-    # ... 前面的 __init__, _save_strategy_positions, _load_strategy_positions 等保持不变 ...
-    # 为了节省篇幅，此处只展示修改的关键方法，完整代码会一并提供。
-
     def __init__(self):
         self.exchange = self._init()
         self.strategy_positions = {}
@@ -731,18 +689,16 @@ class OKXTrader:
 
     def _init(self):
         log("🚀 初始化OKX交易客户端...")
-        proxy = TG_PROXIES.get("http") if TG_PROXIES else "http://127.0.0.1:10809"
-        proxies = {"http": proxy, "https": proxy}
         ex = ccxt.okx({
             "apiKey": API_KEY,
             "secret": API_SECRET,
             "password": API_PASS,
             "enableRateLimit": True,
             "timeout": 30000,
-            "proxies": proxies,
             "options": {"defaultType": "swap"}
         })
         ex.set_sandbox_mode(IS_SANDBOX)
+
         for attempt in range(3):
             try:
                 ex.fetch_balance()
@@ -878,7 +834,7 @@ class OKXTrader:
                 'Content-Type': 'application/json'
             }
             url = "https://www.okx.com" + request_path
-            response = requests.post(url, headers=headers, data=body_json, proxies=TG_PROXIES, timeout=5)
+            response = requests.post(url, headers=headers, data=body_json, timeout=5)
             result = response.json()
             if result.get('code') == '0':
                 log(f"设置杠杆 {symbol} {leverage}x 逐仓成功")
@@ -985,7 +941,6 @@ class OKXTrader:
             log(f"⏸️ {symbol} 已有持仓 {current_positions[ccxt_symbol]}，拒绝重复开仓")
             return False
 
-        # 检测紧急变动，如果紧急变动则强制忽略价格位置检查
         emergency, move_pct = check_emergency_move(symbol, self.exchange.fetch_ticker(symbol)['last'])
         if emergency:
             ignore_price_position = True
@@ -1274,7 +1229,6 @@ class OKXTrader:
             if current_price == 0:
                 continue
 
-            # 更新跟踪价格极值
             if info['side'] == 'long':
                 if current_price > info.get('highest_price', info['open_price']):
                     info['highest_price'] = current_price
@@ -1433,7 +1387,7 @@ def main():
     has_set_pending_this_cycle = False
 
     log("\n========== 全自动交易系统已启动 ==========")
-    push_telegram(f"🤖 交易机器人启动\nK线: {BAR} | 预测: {HORIZON}根 ({HORIZON*3}分钟) | 每{PREDICTION_INTERVAL/60:.1f}分钟一轮\n止盈: +{TAKE_PROFIT_PCT}% | 动态止损: ATR({ATR_PERIOD})×{ATR_MULTIPLIER} | 最长持仓: {MAX_HOLD_SECONDS/60:.0f}分钟\n固定保证金: {MAX_SINGLE_TRADE_USDT} USDT/币\n流动性: 成交额≥{MIN_VOLUME_USDT/1_000_000:.0f}M, 市值≥{MIN_MARKET_CAP_USDT/1_000_000:.0f}M\n仓位模式: 逐仓 {LEVERAGE}x\n信号门槛: 置信度≥{MIN_DIRECTION_CONFIDENCE}, R²≥{MIN_R_SQUARED}, 预期收益≥{MIN_EXPECTED_RETURN*100:.1f}%\n技术指标: RSI周期{RSI_PERIOD} 多单<{RSI_LONG_THRESHOLD} 空单>{RSI_SHORT_THRESHOLD}; MACD({MACD_FAST},{MACD_SLOW},{MACD_SIGNAL}) 柱状图+零轴+15分钟验证\n风控: 最多{MAX_CONCURRENT_POSITIONS}仓, 总保证金≤{MAX_TOTAL_MARGIN_RATIO*100}%权益\n开仓条件: 实体位置(底部/顶部10%) 或 价格有利移动>{FAVORABLE_MOVE_PCT}% 或 紧急动能信号")
+    push_telegram(f"🤖 交易机器人启动\nK线: {BAR} | 预测: {HORIZON}根 ({HORIZON*3}分钟) | 每{PREDICTION_INTERVAL/60:.1f}分钟一轮\n止盈: 动态止损+跟踪止损 | 最长持仓: {MAX_HOLD_SECONDS/60:.0f}分钟\n固定保证金: {MAX_SINGLE_TRADE_USDT} USDT/币\n流动性: 成交额≥{MIN_VOLUME_USDT/1_000_000:.0f}M, 市值≥{MIN_MARKET_CAP_USDT/1_000_000:.0f}M\n仓位模式: 逐仓 {LEVERAGE}x\n信号门槛: 置信度≥{MIN_DIRECTION_CONFIDENCE}, R²≥{MIN_R_SQUARED}, 预期收益≥{MIN_EXPECTED_RETURN*100:.1f}%\n技术指标: RSI周期{RSI_PERIOD} 多单<{RSI_LONG_THRESHOLD} 空单>{RSI_SHORT_THRESHOLD}; MACD({MACD_FAST},{MACD_SLOW},{MACD_SIGNAL}) 柱状图+零轴+15分钟验证\n风控: 最多{MAX_CONCURRENT_POSITIONS}仓, 总保证金≤{MAX_TOTAL_MARGIN_RATIO*100}%权益\n开仓条件: 实体位置(底部/顶部10%) 或 价格有利移动>{FAVORABLE_MOVE_PCT}% 或 紧急动能信号")
 
     while True:
         try:
@@ -1477,6 +1431,7 @@ def main():
 
         except Exception as e:
             err(f"主循环异常: {traceback.format_exc()}")
+            push_telegram(f"❌ 机器人异常崩溃: {str(e)[:100]}")
             time.sleep(10)
 
 if __name__ == "__main__":
