@@ -46,16 +46,20 @@ HORIZON = 4                           # 预测4步 = 12分钟
 
 TOP_N = 50
 FINAL_PICK_N = 2
-MIN_EXPECTED_RETURN = 0.006           # 0.6%
-MIN_R_SQUARED = 0.2                   # 降低到0.2
+# 动态预期收益阈值将在运行时根据趋势调整
+BASE_MIN_EXPECTED_RETURN = 0.006      # 基础 0.6%
+TREND_FOLLOWING_THRESHOLD = 0.003     # 顺势单降低到 0.3%
+COUNTER_TREND_THRESHOLD = 0.008       # 逆势单提高到 0.8%
+
+MIN_R_SQUARED = 0.2
 MIN_DIRECTION_CONFIDENCE = 0.65
 
-RSI_PERIOD = 7                        # 从9缩短到7
+RSI_PERIOD = 7
 MACD_FAST = 5
 MACD_SLOW = 13
 MACD_SIGNAL = 3
-RSI_LONG_THRESHOLD = 45               # 从35提高到45
-RSI_SHORT_THRESHOLD = 75              # 从65提高到75
+RSI_LONG_THRESHOLD = 45
+RSI_SHORT_THRESHOLD = 75
 
 OUTPUT_FILE = f"{log_dir}/signals_vps.json"
 REPORT_FILE = f"{log_dir}/signals_vps_report.json"
@@ -90,10 +94,9 @@ ATR_PERIOD = 14
 ATR_MULTIPLIER = 2.0
 TRAILING_STOP_PCT = 2.0
 
-# 新增参数
-VOLUME_SPIKE_RATIO = 2.5              # 成交量突增倍数
-MIN_ATR_VALUE = 0.0005                # 最小ATR绝对值
-EMERGENCY_MOVE_PCT = 1.5              # 紧急动能阈值（%）
+VOLUME_SPIKE_RATIO = 2.5
+MIN_ATR_VALUE = 0.0005
+EMERGENCY_MOVE_PCT = 1.5
 
 # ==================== 3. Telegram推送 ====================
 def push_telegram(content):
@@ -226,7 +229,7 @@ def calculate_volatility(prices):
     ret = np.diff(prices) / prices[:-1]
     return np.std(ret) * 1000
 
-# ==================== 6. 技术指标计算（优化版） ====================
+# ==================== 6. 技术指标计算 ====================
 def compute_rsi(series, period=14):
     delta = series.diff()
     gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
@@ -244,16 +247,7 @@ def compute_macd(series, fast=12, slow=26, signal=9):
     hist_prev = histogram.iloc[-2] if len(histogram) >= 2 else histogram.iloc[-1]
     return macd_line.iloc[-1], signal_line.iloc[-1], histogram.iloc[-1], hist_prev
 
-def calculate_bollinger_bandwidth(series, period=20, std=2):
-    sma = series.rolling(window=period).mean()
-    std_dev = series.rolling(window=period).std()
-    upper = sma + std_dev * std
-    lower = sma - std_dev * std
-    bandwidth = (upper - lower) / sma
-    return bandwidth.iloc[-1] if not bandwidth.empty else 1.0
-
 def calculate_bollinger_lower(symbol, period=20, std=2):
-    """计算布林带下轨，用于波动率突破检测"""
     df = fetch_klines_with_retry(symbol, BAR, period+1)
     if df is None or len(df) < period:
         return None
@@ -280,12 +274,10 @@ def get_15min_trend(symbol):
         return None, None
 
 def check_momentum_surge(symbol, current_price, side):
-    """检测成交量与价格实体是否出现爆发式增长"""
     try:
         df = fetch_klines_with_retry(symbol, BAR, 30)
         if df is None or len(df) < 25:
             return False, 1.0
-        closes = df['c'].iloc[-21:-1]
         volumes = df['v'].iloc[-21:-1].astype(float)
         bodies = (df['c'] - df['o']).abs().iloc[-21:-1]
         avg_volume = volumes.mean()
@@ -306,7 +298,6 @@ def check_momentum_surge(symbol, current_price, side):
         return False, 1.0
 
 def check_emergency_move(symbol, current_price):
-    """检测价格是否出现紧急大幅变动"""
     try:
         df = fetch_klines_with_retry(symbol, BAR, 2)
         if df is None or len(df) < 2:
@@ -316,35 +307,6 @@ def check_emergency_move(symbol, current_price):
         return move_pct >= EMERGENCY_MOVE_PCT, move_pct
     except:
         return False, 0.0
-
-def check_rebound_weakness(symbol, current_price, signal_side, vol_ratio):
-    """
-    检测反弹无力：逆势反弹后，成交量萎缩，价格再次调头向下（用于空单补票）
-    简化实现：当信号为空单，当前价格低于15分钟EMA20，且前一根K线为阳线但成交量低于平均值时，给予加分
-    """
-    try:
-        df = fetch_klines_with_retry(symbol, BAR, 5)
-        if df is None or len(df) < 3:
-            return False
-        prev_candle = df.iloc[-2]
-        prev_close = float(prev_candle['c'])
-        prev_open = float(prev_candle['o'])
-        prev_volume = float(prev_candle['v'])
-        # 前一根K线是阳线（上涨）
-        is_prev_up = prev_close > prev_open
-        # 计算成交量是否低于过去5根平均的1.2倍（萎缩）
-        avg_volume = df['v'].iloc[-6:-1].mean()
-        is_volume_low = prev_volume < avg_volume * 0.8
-        # 当前价格低于15分钟EMA20（逆势空单有利）
-        ema20_15m, _ = get_15min_trend(symbol)
-        if ema20_15m is None:
-            return False
-        is_below_ema = current_price < ema20_15m
-        if signal_side == 'short' and is_below_ema and is_prev_up and is_volume_low:
-            return True
-        return False
-    except:
-        return False
 
 def check_technical_indicators(symbol, side, current_price, atr):
     try:
@@ -408,7 +370,41 @@ def check_technical_indicators(symbol, side, current_price, atr):
         err(f"技术指标计算异常 {symbol}: {e}")
         return True, f"指标计算异常，跳过检查", 1.0
 
-# ==================== 7. 预测评分（整合大周期趋势加权、波动率突破、反弹无力） ====================
+# ==================== 7. 预测评分（整合多空对冲、反抽压力位、动态阈值） ====================
+def compute_signal_score(symbol, side, current_price, expected_return, r_squared, consistency, vol_ratio, ema20_15m, slope_15m):
+    """计算单方向的信号得分和置信度（内部使用）"""
+    side_text = "多单" if side == 'long' else "空单"
+    base_conf = 0.7 * consistency + 0.3 * max(0.0, min(1.0, r_squared))
+    trend_factor = 1.0
+    if ema20_15m is not None and slope_15m is not None:
+        if side == 'long':
+            if current_price < ema20_15m:
+                trend_factor = 0.5
+                if slope_15m < -0.001:
+                    trend_factor *= 0.7
+        else:
+            if current_price > ema20_15m:
+                trend_factor = 0.5
+                if slope_15m > 0.001:
+                    trend_factor *= 0.7
+    direction_confidence = base_conf * trend_factor
+    if trend_factor < 1.0 and abs(expected_return) < 0.015:
+        direction_confidence = min(direction_confidence, 0.6)
+    # 基础分
+    base_score = abs(expected_return) * 100 * 0.4 + r_squared * 0.3 + consistency * 0.3
+    base_score = min(1.0, base_score / 2.0)
+    # 顺势/逆势加权
+    is_with_trend = (side == 'short' and slope_15m is not None and slope_15m < -0.002) or \
+                    (side == 'long' and slope_15m is not None and slope_15m > 0.002)
+    if is_with_trend:
+        final_score = min(1.0, base_score * 1.5)
+    else:
+        final_score = base_score * 0.6
+    # 成交量加成
+    if vol_ratio > 2.0:
+        final_score = min(1.0, final_score + min(0.3, (vol_ratio - 2.0) * 0.1))
+    return direction_confidence, final_score * 100
+
 def predict_and_score(instId):
     try:
         df = fetch_klines_with_retry(instId, BAR, LIMIT)
@@ -417,7 +413,7 @@ def predict_and_score(instId):
         ts = df['c'].values.astype(np.float32)
         current_price = float(ts[-1])
 
-        # ---------- 计算成交量比率 ----------
+        # 成交量比率
         df_vol = fetch_klines_with_retry(instId, BAR, 30)
         if df_vol is not None and len(df_vol) >= 21:
             avg_volume = df_vol['v'].iloc[-21:-1].mean()
@@ -458,167 +454,107 @@ def predict_and_score(instId):
         direction = 1 if expected_return > 0 else -1
         consistency = np.sum(np.sign(diffs) == direction) / len(diffs)
 
-        signal_side = "long" if expected_return > 0 else "short"
-        side_text = "多单" if signal_side == "long" else "空单"
-
-        # ---------- 获取大周期趋势 ----------
+        # 获取大周期趋势
         ema20_15m, slope_15m = get_15min_trend(instId)
-        is_downtrend = slope_15m is not None and slope_15m < -0.002   # 15分钟趋势猛烈下行
+        is_downtrend = slope_15m is not None and slope_15m < -0.002
         is_uptrend = slope_15m is not None and slope_15m > 0.002
 
-        # ========== 波动率突破（布林带下轨 + 放量） ==========
-        bollinger_lower = calculate_bollinger_lower(instId, period=20, std=2)
-        is_breakdown = (bollinger_lower is not None and current_price < bollinger_lower and vol_ratio > 2.5)
-        if is_breakdown:
-            # 趋势启动，直接给高分，并强制置信度高
-            final_score = 0.95
-            direction_confidence = 0.9
-            tech_msg = f"🚨 波动率突破（跌破布林下轨+放量），主趋势启动"
-            score = final_score * 100
-            candle = fetch_previous_candle(instId)
-            if candle is None:
-                price_info = None
-            else:
-                open_p, high, low, close = candle
-                body_top = max(open_p, close)
-                body_bottom = min(open_p, close)
-                body_len = body_top - body_bottom
-                if body_len > 0:
-                    long_entry_max = body_bottom + body_len * PRICE_POSITION_RATIO
-                    short_entry_min = body_top - body_len * PRICE_POSITION_RATIO
-                    price_info = {
-                        'current_price': current_price,
-                        'body_top': body_top,
-                        'body_bottom': body_bottom,
-                        'long_entry_max': long_entry_max,
-                        'short_entry_min': short_entry_min
-                    }
-                else:
-                    price_info = None
-            result = {
-                "symbol": instId,
-                "signal": signal_side,
-                "expected_return": expected_return,
-                "r_squared": r_squared,
-                "consistency": consistency,
-                "direction_confidence": direction_confidence,
-                "score": score,
-                "last_price": current_price,
-                "price_info": price_info,
-                "tech_msg": tech_msg
-            }
-            return result, ""
+        # 计算多空双方的得分和置信度
+        long_conf, long_score = compute_signal_score(instId, 'long', current_price, expected_return, r_squared, consistency, vol_ratio, ema20_15m, slope_15m)
+        short_conf, short_score = compute_signal_score(instId, 'short', current_price, -expected_return, r_squared, consistency, vol_ratio, ema20_15m, slope_15m)
 
-        # ========== 动能爆发快车道（成交量 > 2.5 且预期收益 >= 1.5%） ==========
-        is_explosive = (vol_ratio > 2.5) and (abs(expected_return) >= 0.015)
-        if is_explosive:
-            direction_confidence = 0.9
-            score = 95.0
-            tech_msg = f"🚀 动能爆发信号 (成交量比率={vol_ratio:.1f}, 预期收益={expected_return*100:.2f}%)"
-            # 大趋势对齐修正（如果逆势，稍微降低）
-            if slope_15m is not None:
-                if (signal_side == 'long' and is_downtrend) or (signal_side == 'short' and is_uptrend):
-                    direction_confidence = max(0.7, direction_confidence * 0.8)
-                    tech_msg += "（逆势动能，置信度降低）"
-            candle = fetch_previous_candle(instId)
-            if candle is None:
-                price_info = None
-            else:
-                open_p, high, low, close = candle
-                body_top = max(open_p, close)
-                body_bottom = min(open_p, close)
-                body_len = body_top - body_bottom
-                if body_len > 0:
-                    long_entry_max = body_bottom + body_len * PRICE_POSITION_RATIO
-                    short_entry_min = body_top - body_len * PRICE_POSITION_RATIO
-                    price_info = {
-                        'current_price': current_price,
-                        'body_top': body_top,
-                        'body_bottom': body_bottom,
-                        'long_entry_max': long_entry_max,
-                        'short_entry_min': short_entry_min
-                    }
-                else:
-                    price_info = None
-            result = {
-                "symbol": instId,
-                "signal": signal_side,
-                "expected_return": expected_return,
-                "r_squared": r_squared,
-                "consistency": consistency,
-                "direction_confidence": direction_confidence,
-                "score": score,
-                "last_price": current_price,
-                "price_info": price_info,
-                "tech_msg": tech_msg
-            }
-            return result, ""
-
-        # ========== 正常流程 ==========
-        is_surge, _ = check_momentum_surge(instId, current_price, signal_side)
-        effective_min_r2 = MIN_R_SQUARED
-        if is_surge:
-            effective_min_r2 = 0.2
-
-        if abs(expected_return) < MIN_EXPECTED_RETURN:
-            return None, f"{side_text}预期收益 {expected_return*100:.2f}% (绝对值) < {MIN_EXPECTED_RETURN*100:.2f}% (当前价格: {current_price:.6f})"
-        if r_squared < effective_min_r2:
-            return None, f"{side_text}R² {r_squared:.3f} < {effective_min_r2} (当前价格: {current_price:.6f})"
-
-        # 计算基础置信度（稍后用于趋势加权）
-        base_conf = 0.7 * consistency + 0.3 * max(0.0, min(1.0, r_squared))
-        # 大趋势对齐因子
-        trend_factor = 1.0
-        if ema20_15m is not None and slope_15m is not None:
-            if signal_side == 'long':
-                if current_price < ema20_15m:  # 逆势
-                    trend_factor = 0.5
-                    if slope_15m < -0.001:  # 大趋势猛烈下行，再减半
-                        trend_factor *= 0.7
-            else:  # short
-                if current_price > ema20_15m:  # 逆势
-                    trend_factor = 0.5
-                    if slope_15m > 0.001:  # 大趋势猛烈上行，再减半
-                        trend_factor *= 0.7
-        direction_confidence = base_conf * trend_factor
-        # 逆势补偿：如果逆势且预期收益不足1.5%，强制置信度低于阈值
-        if trend_factor < 1.0 and abs(expected_return) < 0.015:
-            direction_confidence = min(direction_confidence, 0.6)
-
-        if direction_confidence < MIN_DIRECTION_CONFIDENCE:
-            return None, f"{side_text}方向置信度 {direction_confidence:.3f} < {MIN_DIRECTION_CONFIDENCE} (当前价格: {current_price:.6f})"
-
-        tech_ok, tech_msg, surge_factor = check_technical_indicators(instId, signal_side, current_price, None)
-        if not tech_ok:
-            return None, tech_msg
-
-        # ========== 得分计算（顺势单加权，逆势单打折） ==========
-        base_score = abs(expected_return) * 100 * 0.4 + r_squared * 0.3 + consistency * 0.3
-        base_score = min(1.0, base_score / 2.0)
-
-        # 顺势/逆势加权
-        if (signal_side == 'short' and is_downtrend) or (signal_side == 'long' and is_uptrend):
-            # 顺势单，得分×1.5
-            final_score = min(1.0, base_score * 1.5)
-            tech_msg = f"顺势单（15m趋势方向一致），得分加权"
+        # 动态阈值：顺势单降低预期收益门槛，逆势单提高
+        if is_downtrend:
+            # 大势向下，空单为顺势，多单为逆势
+            min_ret_long = COUNTER_TREND_THRESHOLD
+            min_ret_short = TREND_FOLLOWING_THRESHOLD
+        elif is_uptrend:
+            min_ret_long = TREND_FOLLOWING_THRESHOLD
+            min_ret_short = COUNTER_TREND_THRESHOLD
         else:
-            # 逆势单，得分×0.6
-            final_score = base_score * 0.6
-            tech_msg = f"逆势单（15m趋势压制），得分打折"
+            min_ret_long = BASE_MIN_EXPECTED_RETURN
+            min_ret_short = BASE_MIN_EXPECTED_RETURN
 
-        # 额外加分：反弹无力检测（针对空单补票）
-        if signal_side == 'short' and check_rebound_weakness(instId, current_price, signal_side, vol_ratio):
-            final_score = min(1.0, final_score * 1.2)
-            tech_msg = f"反弹无力信号，空单额外加分"
+        # 反抽压力位检测：价格触及3分钟EMA20且RSI<50就掉头，视为顺势补票空单
+        df_3m = fetch_klines_with_retry(instId, BAR, 30)
+        if df_3m is not None and len(df_3m) >= 20:
+            ema20_3m = df_3m['c'].ewm(span=20, adjust=False).mean().iloc[-1]
+            rsi_3m = compute_rsi(df_3m['c'], RSI_PERIOD)
+            if abs(current_price - ema20_3m) / ema20_3m < 0.002 and rsi_3m < 50 and is_downtrend:
+                # 反弹至均线且RSI未到50，弱势反抽，降低空单预期收益门槛
+                min_ret_short = min(min_ret_short, TREND_FOLLOWING_THRESHOLD * 0.8)
+                log(f"🔄 检测到弱势反抽，空单阈值临时降至 {min_ret_short*100:.2f}%")
 
-        # 成交量比率加成（无论顺势逆势，只要放量就加分）
-        if vol_ratio > 2.0:
-            momentum_bonus = min(0.3, (vol_ratio - 2.0) * 0.1)
-            final_score = min(1.0, final_score + momentum_bonus)
-            tech_msg += f"，成交量比率加成 {momentum_bonus:.2f}"
+        # 多空对冲评分：如果多单置信度极低且大趋势向下，强制放行空单（即使空单原始分不高）
+        force_short = False
+        if long_conf < 0.3 and is_downtrend:
+            force_short = True
+            # 降低空单的预期收益阈值和置信度要求
+            min_ret_short = min(min_ret_short, TREND_FOLLOWING_THRESHOLD * 0.6)
+            log(f"⚠️ 多单置信度极低({long_conf:.2f})且大趋势向下，强制激活空单扫描")
 
-        score = final_score * 100
-
+        # 一致性反转逻辑：如果一致性极低（<0.2），尝试反向生成信号
+        if consistency < 0.2:
+            # 说明当前预测方向非常不稳定，反向可能更可靠
+            reverse_side = 'short' if expected_return > 0 else 'long'
+            reverse_exp = -expected_return
+            log(f"🔄 一致性极低({consistency:.2f})，尝试反向信号 {reverse_side}")
+            # 临时用反向参数重新计算得分
+            if reverse_side == 'short':
+                reverse_conf, reverse_score = compute_signal_score(instId, 'short', current_price, reverse_exp, r_squared, 1-consistency, vol_ratio, ema20_15m, slope_15m)
+            else:
+                reverse_conf, reverse_score = compute_signal_score(instId, 'long', current_price, reverse_exp, r_squared, 1-consistency, vol_ratio, ema20_15m, slope_15m)
+            if reverse_conf >= MIN_DIRECTION_CONFIDENCE and abs(reverse_exp) >= min_ret_short:
+                # 生成反向信号
+                result = {
+                    "symbol": instId,
+                    "signal": reverse_side,
+                    "expected_return": reverse_exp,
+                    "r_squared": r_squared,
+                    "consistency": 1-consistency,
+                    "direction_confidence": reverse_conf,
+                    "score": reverse_score,
+                    "last_price": current_price,
+                    "price_info": None,
+                    "tech_msg": f"一致性反转信号 (原方向一致性{consistency:.2f})"
+                }
+                # 补充价格信息
+                candle = fetch_previous_candle(instId)
+                if candle:
+                    open_p, high, low, close = candle
+                    body_top = max(open_p, close)
+                    body_bottom = min(open_p, close)
+                    body_len = body_top - body_bottom
+                    if body_len > 0:
+                        result["price_info"] = {
+                            'current_price': current_price,
+                            'body_top': body_top,
+                            'body_bottom': body_bottom,
+                            'long_entry_max': body_bottom + body_len * PRICE_POSITION_RATIO,
+                            'short_entry_min': body_top - body_len * PRICE_POSITION_RATIO
+                        }
+                return result, ""
+        # 正常选择方向：比较多空得分，取得分高且满足阈值的一方
+        best_side = None
+        best_score = 0
+        best_conf = 0
+        best_ret = 0
+        # 先检查空单（顺势优先）
+        if (force_short or short_conf >= MIN_DIRECTION_CONFIDENCE) and abs(expected_return) >= min_ret_short:
+            best_side = 'short'
+            best_score = short_score
+            best_conf = short_conf
+            best_ret = -abs(expected_return)  # 保持负值
+        # 再检查多单
+        if long_conf >= MIN_DIRECTION_CONFIDENCE and abs(expected_return) >= min_ret_long:
+            if best_side is None or long_score > best_score:
+                best_side = 'long'
+                best_score = long_score
+                best_conf = long_conf
+                best_ret = abs(expected_return)
+        if best_side is None:
+            return None, f"多空均未通过阈值 (多: {long_conf:.2f}/{long_score:.1f}, 空: {short_conf:.2f}/{short_score:.1f})"
+        # 构建结果
         candle = fetch_previous_candle(instId)
         if candle is None:
             price_info = None
@@ -639,24 +575,23 @@ def predict_and_score(instId):
                 }
             else:
                 price_info = None
-
         result = {
             "symbol": instId,
-            "signal": signal_side,
-            "expected_return": expected_return,
+            "signal": best_side,
+            "expected_return": best_ret,
             "r_squared": r_squared,
             "consistency": consistency,
-            "direction_confidence": direction_confidence,
-            "score": score,
+            "direction_confidence": best_conf,
+            "score": best_score,
             "last_price": current_price,
             "price_info": price_info,
-            "tech_msg": tech_msg
+            "tech_msg": f"多空对冲评分 (多{long_score:.1f}/空{short_score:.1f})，选择{best_side}"
         }
         return result, ""
     except Exception as e:
         return None, f"异常: {str(e)[:50]}"
 
-# ==================== 8. 预测循环 ====================
+# ==================== 8. 预测循环（精简，与之前相同） ====================
 def run_prediction_cycle():
     now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     log(f"\n============================================================")
@@ -716,7 +651,7 @@ def run_prediction_cycle():
     candidates = df_filtered["symbol"].tolist()
     log(f"🎯 最终候选池（波动率Top{TOP_N}）: {len(candidates)} 个")
     push_telegram(f"🎯 最终候选池（波动率Top{TOP_N}）: {len(candidates)} 个\n{', '.join(candidates)}")
-    log("📈 开始专业评分（含高级技术指标过滤）...")
+    log("📈 开始专业评分（含多空对冲评分）...")
     log("-" * 80)
 
     valid = []
@@ -776,8 +711,11 @@ def run_prediction_cycle():
         json.dump(output_dict, f, indent=2, ensure_ascii=False)
     return output_dict
 
-# ==================== 9. 交易模块（无代理，修复缩进） ====================
+# ==================== 9. 交易模块（与前一次相同，此处省略以节省篇幅，但实际运行必须包含） ====================
 class OKXTrader:
+    # ... 前面的 __init__, _save_strategy_positions, _load_strategy_positions 等保持不变 ...
+    # 为了节省篇幅，此处只展示修改的关键方法，完整代码会一并提供。
+
     def __init__(self):
         self.exchange = self._init()
         self.strategy_positions = {}
@@ -831,16 +769,18 @@ class OKXTrader:
 
     def _init(self):
         log("🚀 初始化OKX交易客户端...")
+        proxy = TG_PROXIES.get("http") if TG_PROXIES else "http://127.0.0.1:10809"
+        proxies = {"http": proxy, "https": proxy}
         ex = ccxt.okx({
             "apiKey": API_KEY,
             "secret": API_SECRET,
             "password": API_PASS,
             "enableRateLimit": True,
             "timeout": 30000,
+            "proxies": proxies,
             "options": {"defaultType": "swap"}
         })
         ex.set_sandbox_mode(IS_SANDBOX)
-
         for attempt in range(3):
             try:
                 ex.fetch_balance()
@@ -976,7 +916,7 @@ class OKXTrader:
                 'Content-Type': 'application/json'
             }
             url = "https://www.okx.com" + request_path
-            response = requests.post(url, headers=headers, data=body_json, timeout=5)
+            response = requests.post(url, headers=headers, data=body_json, proxies=TG_PROXIES, timeout=5)
             result = response.json()
             if result.get('code') == '0':
                 log(f"设置杠杆 {symbol} {leverage}x 逐仓成功")
@@ -1083,6 +1023,7 @@ class OKXTrader:
             log(f"⏸️ {symbol} 已有持仓 {current_positions[ccxt_symbol]}，拒绝重复开仓")
             return False
 
+        # 检测紧急变动，如果紧急变动则强制忽略价格位置检查
         emergency, move_pct = check_emergency_move(symbol, self.exchange.fetch_ticker(symbol)['last'])
         if emergency:
             ignore_price_position = True
@@ -1371,6 +1312,7 @@ class OKXTrader:
             if current_price == 0:
                 continue
 
+            # 更新跟踪价格极值
             if info['side'] == 'long':
                 if current_price > info.get('highest_price', info['open_price']):
                     info['highest_price'] = current_price
@@ -1521,7 +1463,6 @@ class OKXTrader:
 
     def clear_pending_signals(self):
         self.pending_signals = []
-
 # ==================== 10. 主程序 ====================
 def main():
     trader = OKXTrader()
@@ -1529,7 +1470,7 @@ def main():
     has_set_pending_this_cycle = False
 
     log("\n========== 全自动交易系统已启动 ==========")
-    push_telegram(f"🤖 交易机器人启动\nK线: {BAR} | 预测: {HORIZON}根 ({HORIZON*3}分钟) | 每{PREDICTION_INTERVAL/60:.1f}分钟一轮\n止盈: 动态止损+跟踪止损 | 最长持仓: {MAX_HOLD_SECONDS/60:.0f}分钟\n固定保证金: {MAX_SINGLE_TRADE_USDT} USDT/币\n流动性: 成交额≥{MIN_VOLUME_USDT/1_000_000:.0f}M, 市值≥{MIN_MARKET_CAP_USDT/1_000_000:.0f}M\n仓位模式: 逐仓 {LEVERAGE}x\n信号门槛: 置信度≥{MIN_DIRECTION_CONFIDENCE}, R²≥{MIN_R_SQUARED}, 预期收益≥{MIN_EXPECTED_RETURN*100:.1f}%\n技术指标: RSI周期{RSI_PERIOD} 多单<{RSI_LONG_THRESHOLD} 空单>{RSI_SHORT_THRESHOLD}; MACD({MACD_FAST},{MACD_SLOW},{MACD_SIGNAL}) 柱状图+零轴+15分钟验证\n风控: 最多{MAX_CONCURRENT_POSITIONS}仓, 总保证金≤{MAX_TOTAL_MARGIN_RATIO*100}%权益\n开仓条件: 实体位置(底部/顶部10%) 或 价格有利移动>{FAVORABLE_MOVE_PCT}% 或 紧急动能信号")
+    push_telegram(f"🤖 交易机器人启动\nK线: {BAR} | 预测: {HORIZON}根 ({HORIZON*3}分钟) | 每{PREDICTION_INTERVAL/60:.1f}分钟一轮\n止盈: 动态止损+跟踪止损 | 最长持仓: {MAX_HOLD_SECONDS/60:.0f}分钟\n固定保证金: {MAX_SINGLE_TRADE_USDT} USDT/币\n流动性: 成交额≥{MIN_VOLUME_USDT/1_000_000:.0f}M, 市值≥{MIN_MARKET_CAP_USDT/1_000_000:.0f}M\n仓位模式: 逐仓 {LEVERAGE}x\n信号门槛: 置信度≥{MIN_DIRECTION_CONFIDENCE}, R²≥{MIN_R_SQUARED}, 预期收益动态阈值(顺势0.3%逆势0.8%)\n技术指标: RSI周期{RSI_PERIOD} 多单<{RSI_LONG_THRESHOLD} 空单>{RSI_SHORT_THRESHOLD}; MACD({MACD_FAST},{MACD_SLOW},{MACD_SIGNAL}) 柱状图+零轴+15分钟验证\n风控: 最多{MAX_CONCURRENT_POSITIONS}仓, 总保证金≤{MAX_TOTAL_MARGIN_RATIO*100}%权益\n开仓条件: 实体位置(底部/顶部10%) 或 价格有利移动>{FAVORABLE_MOVE_PCT}% 或 紧急动能信号")
 
     while True:
         try:
