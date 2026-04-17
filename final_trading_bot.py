@@ -290,6 +290,56 @@ def check_emergency_move(symbol, current_price):
     except:
         return False, 0.0
 
+def get_higher_trend_indicators(symbol):
+    """获取15分钟级别的EMA20和RSI，用于大趋势对齐"""
+    try:
+        df = fetch_klines_with_retry(symbol, HIGHER_BAR, 50)
+        if df is None or len(df) < 20:
+            return None, None
+        closes = df['c']
+        ema20 = closes.ewm(span=20, adjust=False).mean().iloc[-1]
+        rsi = compute_rsi(closes, RSI_PERIOD)
+        return ema20, rsi
+    except Exception as e:
+        err(f"获取大周期指标失败 {symbol}: {e}")
+        return None, None
+
+def calculate_enhanced_confidence(consistency, r_squared, expected_return, signal_side, current_price, vol_ratio, ema20_15m, rsi_15m):
+    """
+    增强置信度计算：整合大周期趋势对齐因子和动能动态权重
+    返回最终置信度
+    """
+    # 1. 基础置信度（根据成交量比率动态调整权重）
+    if vol_ratio > 2.5:
+        # 爆发行情：一致性权重占 90%，R² 权重占 10%
+        base_conf = 0.9 * consistency + 0.1 * max(0.0, min(1.0, r_squared))
+    else:
+        # 普通行情：保持原来的 0.7/0.3 分配
+        base_conf = 0.7 * consistency + 0.3 * max(0.0, min(1.0, r_squared))
+
+    # 2. 大趋势对齐因子 (Trend Alignment Factor)
+    trend_factor = 1.0
+    if ema20_15m is not None and rsi_15m is not None:
+        if signal_side == 'long':  # 多单信号
+            if current_price < ema20_15m:  # 价格在15m均线下，属于逆势
+                trend_factor = 0.5
+                if rsi_15m > 45:  # 大级别还没跌透
+                    trend_factor *= 0.7
+        else:  # 空单信号
+            if current_price > ema20_15m:  # 价格在15m均线上，属于逆势
+                trend_factor = 0.5
+                if rsi_15m < 55:
+                    trend_factor *= 0.7
+
+    # 3. 最终置信度
+    final_confidence = base_conf * trend_factor
+
+    # 4. 极端逆势补偿：如果是逆势单，且预期收益没达到补偿风险的程度，强制降低置信度
+    if trend_factor < 1.0 and abs(expected_return) < 0.015:
+        final_confidence = min(final_confidence, 0.6)  # 强制低于 MIN_DIRECTION_CONFIDENCE (0.65)
+
+    return final_confidence
+
 def check_technical_indicators(symbol, side, current_price, atr):
     try:
         df = fetch_klines_with_retry(symbol, BAR, 100)
@@ -352,7 +402,7 @@ def check_technical_indicators(symbol, side, current_price, atr):
         err(f"技术指标计算异常 {symbol}: {e}")
         return True, f"指标计算异常，跳过检查", 1.0
 
-# ==================== 7. 预测评分（重构得分算法） ====================
+# ==================== 7. 预测评分（整合增强置信度和快车道） ====================
 def predict_and_score(instId):
     try:
         df = fetch_klines_with_retry(instId, BAR, LIMIT)
@@ -360,6 +410,15 @@ def predict_and_score(instId):
             return None, "数据不足"
         ts = df['c'].values.astype(np.float32)
         current_price = float(ts[-1])
+
+        # ---------- 计算成交量比率 ----------
+        df_vol = fetch_klines_with_retry(instId, BAR, 30)
+        if df_vol is not None and len(df_vol) >= 21:
+            avg_volume = df_vol['v'].iloc[-21:-1].mean()
+            current_volume = float(df_vol['v'].iloc[-1])
+            vol_ratio = current_volume / avg_volume if avg_volume > 0 else 1.0
+        else:
+            vol_ratio = 1.0
 
         with torch.no_grad():
             try:
@@ -393,30 +452,77 @@ def predict_and_score(instId):
         direction = 1 if expected_return > 0 else -1
         consistency = np.sum(np.sign(diffs) == direction) / len(diffs)
 
-        direction_confidence = 0.7 * consistency + 0.3 * max(0.0, min(1.0, r_squared))
-
         signal_side = "long" if expected_return > 0 else "short"
         side_text = "多单" if signal_side == "long" else "空单"
 
-        # 快速计算ATR用于波动率判断
-        def quick_atr(symbol, period=14):
-            df_atr = fetch_klines_with_retry(symbol, BAR, period+1)
-            if df_atr is None or len(df_atr) < period+1:
-                return None
-            high = df_atr['h'].values
-            low = df_atr['l'].values
-            close = df_atr['c'].values
-            tr = np.maximum(high[1:] - low[1:],
-                            np.abs(high[1:] - close[:-1]),
-                            np.abs(low[1:] - close[:-1]))
-            return np.mean(tr[-period:])
+        # ---------- 获取大周期指标 ----------
+        ema20_15m, rsi_15m = get_higher_trend_indicators(instId)
 
-        atr = quick_atr(instId, ATR_PERIOD)
-        emergency, move_pct = check_emergency_move(instId, current_price)
+        # ========== 动能爆发快车道 ==========
+        is_explosive = (vol_ratio > 2.5) and (abs(expected_return) >= 0.015)  # 预期收益 >= 1.5%
+        if is_explosive:
+            # 强制通过，赋予高分，但仍然计算增强置信度用于过滤（但这里我们直接给高置信度）
+            direction_confidence = 0.9
+            score = 95.0
+            tech_msg = f"🚀 动能爆发信号 (成交量比率={vol_ratio:.1f}, 预期收益={expected_return*100:.2f}%)"
+            # 仍然用大趋势对齐修正一下（可选）
+            if ema20_15m is not None and rsi_15m is not None:
+                trend_factor = 1.0
+                if signal_side == 'long' and current_price < ema20_15m:
+                    trend_factor = 0.5
+                    if rsi_15m > 45:
+                        trend_factor *= 0.7
+                elif signal_side == 'short' and current_price > ema20_15m:
+                    trend_factor = 0.5
+                    if rsi_15m < 55:
+                        trend_factor *= 0.7
+                if trend_factor < 1.0 and abs(expected_return) < 0.02:
+                    # 如果逆势且预期收益不够大，稍微降低置信度，但不完全过滤
+                    direction_confidence = max(0.7, direction_confidence * trend_factor)
+            candle = fetch_previous_candle(instId)
+            if candle is None:
+                price_info = None
+            else:
+                open_p, high, low, close = candle
+                body_top = max(open_p, close)
+                body_bottom = min(open_p, close)
+                body_len = body_top - body_bottom
+                if body_len > 0:
+                    long_entry_max = body_bottom + body_len * PRICE_POSITION_RATIO
+                    short_entry_min = body_top - body_len * PRICE_POSITION_RATIO
+                    price_info = {
+                        'current_price': current_price,
+                        'body_top': body_top,
+                        'body_bottom': body_bottom,
+                        'long_entry_max': long_entry_max,
+                        'short_entry_min': short_entry_min
+                    }
+                else:
+                    price_info = None
+            result = {
+                "symbol": instId,
+                "signal": signal_side,
+                "expected_return": expected_return,
+                "r_squared": r_squared,
+                "consistency": consistency,
+                "direction_confidence": direction_confidence,
+                "score": score,
+                "last_price": current_price,
+                "price_info": price_info,
+                "tech_msg": tech_msg
+            }
+            return result, ""
 
-        effective_min_r2 = MIN_R_SQUARED
+        # ========== 正常流程：计算增强置信度 ==========
+        direction_confidence = calculate_enhanced_confidence(
+            consistency, r_squared, expected_return, signal_side, current_price, vol_ratio,
+            ema20_15m, rsi_15m
+        )
+
+        # 正常过滤
         is_surge, _ = check_momentum_surge(instId, current_price, signal_side)
-        if emergency or is_surge:
+        effective_min_r2 = MIN_R_SQUARED
+        if is_surge:
             effective_min_r2 = 0.2
 
         if abs(expected_return) < MIN_EXPECTED_RETURN:
@@ -426,16 +532,18 @@ def predict_and_score(instId):
         if direction_confidence < MIN_DIRECTION_CONFIDENCE:
             return None, f"{side_text}方向置信度 {direction_confidence:.3f} < {MIN_DIRECTION_CONFIDENCE} (当前价格: {current_price:.6f})"
 
-        tech_ok, tech_msg, surge_factor = check_technical_indicators(instId, signal_side, current_price, atr)
+        tech_ok, tech_msg, surge_factor = check_technical_indicators(instId, signal_side, current_price, None)
         if not tech_ok:
             return None, tech_msg
 
-        # ========== 重构得分算法 ==========
-        # 基础分
+        # ========== 得分计算（加入 vol_ratio 加成） ==========
         base_score = abs(expected_return) * 100 * 0.4 + r_squared * 0.3 + consistency * 0.3
         base_score = min(1.0, base_score / 2.0)
 
-        # 趋势分：基于价格相对于20周期EMA
+        momentum_bonus = 0.0
+        if vol_ratio > 2.0:
+            momentum_bonus = min(0.3, (vol_ratio - 2.0) * 0.1)
+
         try:
             df_trend = fetch_klines_with_retry(instId, BAR, 30)
             if df_trend is not None and len(df_trend) >= 20:
@@ -451,30 +559,8 @@ def predict_and_score(instId):
         except:
             trend_score = 0.5
 
-        # 动能分：成交量突变强度 + 价格突破强度
-        try:
-            df_break = fetch_klines_with_retry(instId, BAR, 10)
-            if df_break is not None and len(df_break) >= 6:
-                high_5 = df_break['h'].iloc[-6:-1].max()
-                low_5 = df_break['l'].iloc[-6:-1].min()
-                if signal_side == 'long' and current_price > high_5:
-                    break_score = 1.0
-                elif signal_side == 'short' and current_price < low_5:
-                    break_score = 1.0
-                else:
-                    break_score = 0.0
-            else:
-                break_score = 0.0
-        except:
-            break_score = 0.0
-
-        momentum_score = surge_factor * 0.7 + break_score * 0.3
-        momentum_score = min(1.0, momentum_score)
-
-        final_score = base_score * 0.4 + trend_score * 0.3 + momentum_score * 0.3
-        if emergency:
-            final_score = min(1.0, final_score * 1.2)
-
+        final_score = base_score * 0.4 + trend_score * 0.3 + momentum_bonus * 0.3
+        final_score = min(1.0, final_score)
         score = final_score * 100
 
         candle = fetch_previous_candle(instId)
