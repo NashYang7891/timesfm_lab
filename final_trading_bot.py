@@ -768,35 +768,35 @@ class OKXTrader:
             err(f"加载策略持仓失败: {e}")
 
     def _init(self):
-        log("🚀 初始化OKX交易客户端...")
-        proxy = TG_PROXIES.get("http") if TG_PROXIES else "http://127.0.0.1:10809"
-        proxies = {"http": proxy, "https": proxy}
-        ex = ccxt.okx({
-            "apiKey": API_KEY,
-            "secret": API_SECRET,
-            "password": API_PASS,
-            "enableRateLimit": True,
-            "timeout": 30000,
-            "proxies": proxies,
-            "options": {"defaultType": "swap"}
-        })
-        ex.set_sandbox_mode(IS_SANDBOX)
-        for attempt in range(3):
+    log("🚀 初始化OKX交易客户端...")
+    # 代理设置：只有 TG_PROXIES 非空时才使用
+    proxies = TG_PROXIES if TG_PROXIES else None
+    ex = ccxt.okx({
+        "apiKey": API_KEY,
+        "secret": API_SECRET,
+        "password": API_PASS,
+        "enableRateLimit": True,
+        "timeout": 30000,
+        "proxies": proxies,
+        "options": {"defaultType": "swap"}
+    })
+    ex.set_sandbox_mode(IS_SANDBOX)
+    for attempt in range(3):
+        try:
+            ex.fetch_balance()
             try:
-                ex.fetch_balance()
-                try:
-                    ex.set_position_mode(True)
-                    log("✅ 已开启双向持仓模式")
-                except Exception as e:
-                    err(f"设置双向持仓模式失败（可能已开启）: {e}")
-                log("✅ OKX客户端连接成功")
-                return ex
+                ex.set_position_mode(True)
+                log("✅ 已开启双向持仓模式")
             except Exception as e:
-                err(f"连接尝试 {attempt+1}/3 失败: {e}")
-                if attempt == 2:
-                    raise
-                time.sleep(2)
-        return ex
+                err(f"设置双向持仓模式失败（可能已开启）: {e}")
+            log("✅ OKX客户端连接成功")
+            return ex
+        except Exception as e:
+            err(f"连接尝试 {attempt+1}/3 失败: {e}")
+            if attempt == 2:
+                raise
+            time.sleep(2)
+    return ex
 
     def get_account_equity(self):
         try:
