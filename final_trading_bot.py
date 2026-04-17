@@ -373,7 +373,6 @@ def check_technical_indicators(symbol, side, current_price, atr):
 # ==================== 7. 预测评分（整合多空对冲、反抽压力位、动态阈值） ====================
 def compute_signal_score(symbol, side, current_price, expected_return, r_squared, consistency, vol_ratio, ema20_15m, slope_15m):
     """计算单方向的信号得分和置信度（内部使用）"""
-    side_text = "多单" if side == 'long' else "空单"
     base_conf = 0.7 * consistency + 0.3 * max(0.0, min(1.0, r_squared))
     trend_factor = 1.0
     if ema20_15m is not None and slope_15m is not None:
@@ -591,7 +590,7 @@ def predict_and_score(instId):
     except Exception as e:
         return None, f"异常: {str(e)[:50]}"
 
-# ==================== 8. 预测循环（精简，与之前相同） ====================
+# ==================== 8. 预测循环 ====================
 def run_prediction_cycle():
     now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     log(f"\n============================================================")
@@ -711,11 +710,8 @@ def run_prediction_cycle():
         json.dump(output_dict, f, indent=2, ensure_ascii=False)
     return output_dict
 
-# ==================== 9. 交易模块（与前一次相同，此处省略以节省篇幅，但实际运行必须包含） ====================
+# ==================== 9. 交易模块（完整版，无代理） ====================
 class OKXTrader:
-    # ... 前面的 __init__, _save_strategy_positions, _load_strategy_positions 等保持不变 ...
-    # 为了节省篇幅，此处只展示修改的关键方法，完整代码会一并提供。
-
     def __init__(self):
         self.exchange = self._init()
         self.strategy_positions = {}
@@ -768,35 +764,35 @@ class OKXTrader:
             err(f"加载策略持仓失败: {e}")
 
     def _init(self):
-    log("🚀 初始化OKX交易客户端...")
-    # 代理设置：只有 TG_PROXIES 非空时才使用
-    proxies = TG_PROXIES if TG_PROXIES else None
-    ex = ccxt.okx({
-        "apiKey": API_KEY,
-        "secret": API_SECRET,
-        "password": API_PASS,
-        "enableRateLimit": True,
-        "timeout": 30000,
-        "proxies": proxies,
-        "options": {"defaultType": "swap"}
-    })
-    ex.set_sandbox_mode(IS_SANDBOX)
-    for attempt in range(3):
-        try:
-            ex.fetch_balance()
+        log("🚀 初始化OKX交易客户端...")
+        # 代理设置：只有 TG_PROXIES 非空时才使用
+        proxies = TG_PROXIES if TG_PROXIES else None
+        ex = ccxt.okx({
+            "apiKey": API_KEY,
+            "secret": API_SECRET,
+            "password": API_PASS,
+            "enableRateLimit": True,
+            "timeout": 30000,
+            "proxies": proxies,
+            "options": {"defaultType": "swap"}
+        })
+        ex.set_sandbox_mode(IS_SANDBOX)
+        for attempt in range(3):
             try:
-                ex.set_position_mode(True)
-                log("✅ 已开启双向持仓模式")
+                ex.fetch_balance()
+                try:
+                    ex.set_position_mode(True)
+                    log("✅ 已开启双向持仓模式")
+                except Exception as e:
+                    err(f"设置双向持仓模式失败（可能已开启）: {e}")
+                log("✅ OKX客户端连接成功")
+                return ex
             except Exception as e:
-                err(f"设置双向持仓模式失败（可能已开启）: {e}")
-            log("✅ OKX客户端连接成功")
-            return ex
-        except Exception as e:
-            err(f"连接尝试 {attempt+1}/3 失败: {e}")
-            if attempt == 2:
-                raise
-            time.sleep(2)
-    return ex
+                err(f"连接尝试 {attempt+1}/3 失败: {e}")
+                if attempt == 2:
+                    raise
+                time.sleep(2)
+        return ex
 
     def get_account_equity(self):
         try:
@@ -916,7 +912,7 @@ class OKXTrader:
                 'Content-Type': 'application/json'
             }
             url = "https://www.okx.com" + request_path
-            response = requests.post(url, headers=headers, data=body_json, proxies=TG_PROXIES, timeout=5)
+            response = requests.post(url, headers=headers, data=body_json, timeout=5)
             result = response.json()
             if result.get('code') == '0':
                 log(f"设置杠杆 {symbol} {leverage}x 逐仓成功")
@@ -1023,7 +1019,6 @@ class OKXTrader:
             log(f"⏸️ {symbol} 已有持仓 {current_positions[ccxt_symbol]}，拒绝重复开仓")
             return False
 
-        # 检测紧急变动，如果紧急变动则强制忽略价格位置检查
         emergency, move_pct = check_emergency_move(symbol, self.exchange.fetch_ticker(symbol)['last'])
         if emergency:
             ignore_price_position = True
@@ -1463,6 +1458,7 @@ class OKXTrader:
 
     def clear_pending_signals(self):
         self.pending_signals = []
+
 # ==================== 10. 主程序 ====================
 def main():
     trader = OKXTrader()
