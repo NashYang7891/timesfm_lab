@@ -45,7 +45,7 @@ LIMIT = 900
 HORIZON = 4
 
 TOP_N = 50
-FINAL_PICK_N = 2
+FINAL_PICK_N = 3                     # 改为最多选取3个信号
 BASE_MIN_EXPECTED_RETURN = 0.006
 TREND_FOLLOWING_THRESHOLD = 0.003
 COUNTER_TREND_THRESHOLD = 0.008
@@ -71,7 +71,7 @@ IS_SANDBOX = False
 
 PREDICTION_INTERVAL = 60
 MIN_BALANCE_USDT = 10.0
-MAX_SINGLE_TRADE_USDT = 10
+MAX_SINGLE_TRADE_USDT = 30          # 每个币最多占用30U
 MAX_MARGIN_MULTIPLIER = 2
 
 TAKE_PROFIT_PCT = 8.0
@@ -86,7 +86,7 @@ LEVERAGE = 3
 PRICE_POSITION_RATIO = 0.1
 FAVORABLE_MOVE_PCT = 0.2
 
-MAX_CONCURRENT_POSITIONS = 2
+MAX_CONCURRENT_POSITIONS = 3        # 最多同时持仓3个币
 MAX_TOTAL_MARGIN_RATIO = 0.5
 
 ATR_PERIOD = 14
@@ -721,7 +721,14 @@ def run_prediction_cycle():
         push_telegram(summary)
         return {}
 
+    # 按得分排序并过滤得分 ≥95 的信号
     df_results = pd.DataFrame(valid).sort_values("score", ascending=False)
+    df_results = df_results[df_results['score'] >= 95]
+    if df_results.empty:
+        log("❌ 无得分 ≥95 的高质量信号")
+        push_telegram("❌ 本轮无得分 ≥95 的高质量信号")
+        return {}
+
     top = df_results.head(FINAL_PICK_N)
 
     msg = ["✅ 高质量交易信号："]
@@ -753,7 +760,7 @@ def run_prediction_cycle():
         msg.append("")
     push_telegram("\n".join(msg))
 
-    # 重要：返回包含预期收益的字典
+    # 返回包含预期收益的字典
     output_dict = {row['symbol']: (row['signal'], row['expected_return']) for _, row in top.iterrows()}
     with open(OUTPUT_FILE, "w", encoding="utf-8") as f:
         json.dump({k: v[0] for k, v in output_dict.items()}, f, indent=2, ensure_ascii=False)
@@ -1584,7 +1591,7 @@ def main():
     has_set_pending_this_cycle = False
 
     log("\n========== 全自动交易系统已启动 ==========")
-    push_telegram(f"🤖 交易机器人启动\nK线: {BAR} | 预测: {HORIZON}根 ({HORIZON*3}分钟) | 每{PREDICTION_INTERVAL/60:.1f}分钟一轮\n止盈: 动态止损+跟踪止损 | 最长持仓: {MAX_HOLD_SECONDS/60:.0f}分钟\n固定保证金: {MAX_SINGLE_TRADE_USDT} USDT/币\n流动性: 成交额≥{MIN_VOLUME_USDT/1_000_000:.0f}M, 市值≥{MIN_MARKET_CAP_USDT/1_000_000:.0f}M\n仓位模式: 逐仓 {LEVERAGE}x\n信号门槛: 置信度≥{MIN_DIRECTION_CONFIDENCE}, R²≥{MIN_R_SQUARED}, 预期收益动态阈值\n技术指标: RSI周期{RSI_PERIOD} 多单<{RSI_LONG_THRESHOLD} 空单>{RSI_SHORT_THRESHOLD}; MACD({MACD_FAST},{MACD_SLOW},{MACD_SIGNAL})\n风控: 最多{MAX_CONCURRENT_POSITIONS}仓, 总保证金≤{MAX_TOTAL_MARGIN_RATIO*100}%权益\n开仓条件: 实体位置 或 价格有利移动 或 紧急动能信号")
+    push_telegram(f"🤖 交易机器人启动\nK线: {BAR} | 预测: {HORIZON}根 ({HORIZON*3}分钟) | 每{PREDICTION_INTERVAL/60:.1f}分钟一轮\n止盈: 动态止损+跟踪止损 | 最长持仓: {MAX_HOLD_SECONDS/60:.0f}分钟\n固定保证金: {MAX_SINGLE_TRADE_USDT} USDT/币\n流动性: 成交额≥{MIN_VOLUME_USDT/1_000_000:.0f}M, 市值≥{MIN_MARKET_CAP_USDT/1_000_000:.0f}M\n仓位模式: 逐仓 {LEVERAGE}x\n信号门槛: 得分≥95, 置信度≥{MIN_DIRECTION_CONFIDENCE}, R²≥{MIN_R_SQUARED}\n技术指标: RSI周期{RSI_PERIOD} 多单<{RSI_LONG_THRESHOLD} 空单>{RSI_SHORT_THRESHOLD}; MACD({MACD_FAST},{MACD_SLOW},{MACD_SIGNAL})\n风控: 最多{MAX_CONCURRENT_POSITIONS}仓, 总保证金≤{MAX_TOTAL_MARGIN_RATIO*100}%权益\n开仓条件: 实体位置 或 价格有利移动 或 紧急动能信号")
 
     while True:
         try:
