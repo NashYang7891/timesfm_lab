@@ -781,6 +781,8 @@ def predict_and_score(instId):
         except:
             result["rsi"] = 50
         return result, ""
+    except Exception as e:
+        return None, f"异常: {str(e)[:50]}"
 
 # ==================== 8. 预测循环（详细输出候选池） ====================
 def run_prediction_cycle():
@@ -1832,6 +1834,9 @@ def main():
             err(f"主循环异常: {traceback.format_exc()}")
             push_telegram(f"❌ 机器人异常崩溃: {str(e)[:100]}")
             time.sleep(10)
+
+    # 返回 trader 对象供外部使用
+    return trader
 
 # ==================== 11. 入口（增强异常处理与停止通知） ====================
 if __name__ == "__main__":
