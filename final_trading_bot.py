@@ -938,33 +938,48 @@ def run_prediction_cycle():
             log(f"      R²: {res['r_squared']:.2f} | 一致性: {res['consistency']:.2f} | 方向置信度: {res['direction_confidence']:.2f} | 得分: {res['score']:.4f}")
             log(f"      技术指标: {res['tech_msg']}")
         else:
-            try:
-                adx = get_adx(s)
-                atr_pct = get_atr_percent(s)
-                df_rsi = fetch_klines_with_retry(s, BAR, 20)
-                rsi = compute_rsi(df_rsi['c'], RSI_PERIOD) if df_rsi is not None else 50
-                ts = fetch_klines_with_retry(s, BAR, 50)['c'].values.astype(np.float32)
-                current_price = ts[-1]
-                ema20_15m, slope_15m = get_15min_trend(s)
-                long_conf, long_score = compute_signal_score(s, 'long', current_price, 0, 0, 0, 1, ema20_15m, slope_15m)
-                short_conf, short_score = compute_signal_score(s, 'short', current_price, 0, 0, 0, 1, ema20_15m, slope_15m)
-                candidate_details.append({
-                    "symbol": s,
-                    "long_score": long_score,
-                    "short_score": short_score,
-                    "adx": adx if adx is not None else 0,
-                    "atr_pct": atr_pct if atr_pct is not None else 0,
-                    "rsi": rsi,
-                    "reject_reason": reason,
-                    "signal": None
-                })
-            except Exception as e:
-                candidate_details.append({
-                    "symbol": s,
-                    "long_score": 0, "short_score": 0,
-                    "adx": 0, "atr_pct": 0, "rsi": 50,
-                    "reject_reason": reason, "signal": None
-                })
+    # 从 reject_reason 中尝试提取多空评分（格式如 "多: 0.35/32.2, 空: 0.00/80.6"）
+    long_score = 0.0
+    short_score = 0.0
+    try:
+        # 匹配 "多: X/Y" 和 "空: X/Y"
+        import re
+        match_long = re.search(r'多:\s*[\d.]+/([\d.]+)', reason)
+        match_short = re.search(r'空:\s*[\d.]+/([\d.]+)', reason)
+        if match_long:
+            long_score = float(match_long.group(1))
+        if match_short:
+            short_score = float(match_short.group(1))
+    except:
+        pass
+    
+    # 获取 ADX、ATR%、RSI（如果失败则用0）
+    try:
+        adx = get_adx(s)
+        if adx is None: adx = 0
+    except:
+        adx = 0
+    try:
+        atr_pct = get_atr_percent(s)
+        if atr_pct is None: atr_pct = 0
+    except:
+        atr_pct = 0
+    try:
+        df_rsi = fetch_klines_with_retry(s, BAR, 20)
+        rsi = compute_rsi(df_rsi['c'], RSI_PERIOD) if df_rsi is not None else 50
+    except:
+        rsi = 50
+
+    candidate_details.append({
+        "symbol": s,
+        "long_score": long_score,
+        "short_score": short_score,
+        "adx": adx,
+        "atr_pct": atr_pct,
+        "rsi": rsi,
+        "reject_reason": reason,
+        "signal": None
+    })
 
     detail_lines = []
     detail_lines.append("🎯 最终候选池（波动率Top{}，含多空评分详情）：".format(TOP_N))
