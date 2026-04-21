@@ -502,7 +502,7 @@ def get_atr_percent(symbol, period=ATR_PERIOD):
         return None
 
 def get_adx(symbol, period=14):
-    """计算ADX趋势强度"""
+    """计算ADX趋势强度（简化版，返回当前DX值）"""
     try:
         df = fetch_klines_with_retry(symbol, BAR, period+20)
         if df is None or len(df) < period+10:
@@ -510,21 +510,28 @@ def get_adx(symbol, period=14):
         high = df['h'].values
         low = df['l'].values
         close = df['c'].values
+        
         plus_dm = np.zeros(len(high)-1)
         minus_dm = np.zeros(len(high)-1)
         tr = np.zeros(len(high)-1)
+        
         for i in range(1, len(high)):
             move_up = high[i] - high[i-1]
             move_down = low[i-1] - low[i]
             plus_dm[i-1] = move_up if move_up > move_down and move_up > 0 else 0
             minus_dm[i-1] = move_down if move_down > move_up and move_down > 0 else 0
             tr[i-1] = max(high[i] - low[i], abs(high[i] - close[i-1]), abs(low[i] - close[i-1]))
+        
         atr = np.mean(tr[-period:])
-        plus_di = 100 * np.mean(plus_dm[-period:]) / atr if atr != 0 else 0
-        minus_di = 100 * np.mean(minus_dm[-period:]) / atr if atr != 0 else 0
+        if atr == 0:
+            return 0
+        
+        plus_di = 100 * np.mean(plus_dm[-period:]) / atr
+        minus_di = 100 * np.mean(minus_dm[-period:]) / atr
         dx = 100 * abs(plus_di - minus_di) / (plus_di + minus_di) if (plus_di + minus_di) != 0 else 0
-        adx = np.mean([dx]*period) if period <= len(dx) else dx
-        return adx
+        
+        # 直接返回 DX 作为 ADX（实际 ADX 需要平滑，但此处简化）
+        return dx
     except Exception as e:
         err(f"计算ADX失败 {symbol}: {e}")
         return None
