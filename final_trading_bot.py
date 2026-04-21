@@ -539,7 +539,6 @@ def get_ema9(symbol):
         return None
 
 def check_short_optimized(symbol, long_score, short_score, current_price, is_downtrend, adx, atr_pct, vol_median_pct, long_score_history):
-    # 安全处理 None 值
     adx_str = f"{adx:.1f}" if adx is not None else "N/A"
     if adx is None or adx < ADX_THRESHOLD:
         return False, f"ADX={adx_str} < {ADX_THRESHOLD}，趋势弱"
@@ -572,7 +571,6 @@ def check_short_optimized(symbol, long_score, short_score, current_price, is_dow
     return True, f"通过所有优化条件 (gap={score_gap:.2f}, ADX={adx_str}, 波动率{atr_pct_str}%>{vol_median_pct_str}%)"
 
 def calculate_bollinger_bands(symbol, period=20, std=2):
-    """计算布林带上下轨"""
     try:
         df = fetch_klines_with_retry(symbol, BAR, period+1)
         if df is None or len(df) < period:
@@ -588,15 +586,10 @@ def calculate_bollinger_bands(symbol, period=20, std=2):
         return None, None
 
 def validate_signal(signal_type, symbol, current_price, rsi, adx, atr_pct, forecast_values=None):
-    """
-    信号过滤器：防止高位接多、低位追空
-    返回 (是否通过, 拒绝原因)
-    """
-    # 1. 极端波动率拦截（ATR% > 5% 时，市场可能插针）
+    # 1. 极端波动率拦截
     if atr_pct is not None and atr_pct > 5.0:
         return False, f"波动率过高 ({atr_pct:.2f}%)，暂停开仓"
 
-    # 2. 布林带位置计算
     bb_upper, bb_lower = calculate_bollinger_bands(symbol)
     
     if signal_type == 'LONG':
@@ -606,7 +599,6 @@ def validate_signal(signal_type, symbol, current_price, rsi, adx, atr_pct, forec
             return False, f"价格突破布林带上轨 {bb_upper:.6f}，过高"
         if adx is not None and adx > 60:
             return False, f"ADX={adx:.1f} 趋势极端，可能衰竭"
-        # TimesFM 预测区间校验
         if forecast_values is not None and len(forecast_values) >= 5:
             forecast_high_max = max(forecast_values[:5])
             if forecast_high_max < current_price:
@@ -624,7 +616,7 @@ def validate_signal(signal_type, symbol, current_price, rsi, adx, atr_pct, forec
             if forecast_low_min > current_price:
                 return False, f"TimesFM预测未来最低价 {forecast_low_min:.6f} 高于当前价，下跌空间不足"
 
-    # 4. 成交量异常拦截（选做）
+    # 成交量异常拦截
     try:
         df_vol = fetch_klines_with_retry(symbol, BAR, 21)
         if df_vol is not None and len(df_vol) >= 21:
@@ -696,7 +688,6 @@ def predict_and_score(instId):
         long_conf, long_score = compute_signal_score(instId, 'long', current_price, expected_return, r_squared, consistency, vol_ratio, ema20_15m, slope_15m)
         short_conf, short_score = compute_signal_score(instId, 'short', current_price, -expected_return, r_squared, consistency, vol_ratio, ema20_15m, slope_15m)
 
-        # 存储历史多头评分
         global history_long_scores
         if instId not in history_long_scores:
             history_long_scores[instId] = []
@@ -704,7 +695,6 @@ def predict_and_score(instId):
         if len(history_long_scores[instId]) > LONG_CONF_LOW_BARS + 5:
             history_long_scores[instId] = history_long_scores[instId][-(LONG_CONF_LOW_BARS+5):]
 
-        # 获取ADX、ATR%和中位数波动率
         adx = get_adx(instId)
         atr_pct = get_atr_percent(instId)
         vol_median_pct = None
@@ -726,7 +716,6 @@ def predict_and_score(instId):
                 if len(atr_list) >= VOLATILITY_MEDIAN_PERIOD:
                     vol_median_pct = np.median(atr_list[-VOLATILITY_MEDIAN_PERIOD:])
 
-        # 根据趋势方向设置预期收益门槛
         if is_downtrend:
             min_ret_long = COUNTER_TREND_THRESHOLD
             min_ret_short = TREND_FOLLOWING_THRESHOLD
@@ -737,7 +726,6 @@ def predict_and_score(instId):
             min_ret_long = BASE_MIN_EXPECTED_RETURN
             min_ret_short = BASE_MIN_EXPECTED_RETURN
 
-        # 先检查空单是否满足强化条件
         short_optimized_pass = False
         short_optimized_reason = ""
         if is_downtrend and long_score < LONG_CONF_LOW_THRESHOLD:
@@ -746,7 +734,6 @@ def predict_and_score(instId):
                 adx, atr_pct, vol_median_pct, history_long_scores.get(instId, [])
             )
 
-        # 选择最佳方向
         best_side = None
         best_score = 0
         best_conf = 0
@@ -779,9 +766,8 @@ def predict_and_score(instId):
                 best_conf = long_conf
                 best_ret = abs(expected_return)
 
-        # ========== 新增：信号过滤器拦截 ==========
+        # 信号过滤器拦截
         if best_side is not None:
-            # 获取当前 RSI（用于过滤器）
             try:
                 df_rsi = fetch_klines_with_retry(instId, BAR, 20)
                 if df_rsi is not None and len(df_rsi) >= 14:
@@ -798,11 +784,10 @@ def predict_and_score(instId):
                 rsi=rsi_filter,
                 adx=adx,
                 atr_pct=atr_pct,
-                forecast_values=forecast_values  # 传入 TimesFM 预测序列
+                forecast_values=forecast_values
             )
             if not valid:
                 return None, f"信号过滤器拦截 ({best_side.upper()}): {reject_reason}"
-        # ==========================================
 
         if best_side is None:
             reject_reason = f"多空均未通过阈值 (多: {long_conf:.2f}/{long_score:.1f}, 空: {short_conf:.2f}/{short_score:.1f})"
@@ -810,7 +795,6 @@ def predict_and_score(instId):
                 reject_reason += f" | 空单优化过滤: {short_optimized_reason}"
             return None, reject_reason
 
-        # 获取价格实体信息用于开仓点位
         candle = fetch_previous_candle(instId)
         if candle is None:
             price_info = None
@@ -850,7 +834,6 @@ def predict_and_score(instId):
             "vol_median_pct": vol_median_pct if vol_median_pct is not None else 0,
             "rsi": None,
         }
-        # 补充RSI值
         try:
             df_rsi = fetch_klines_with_retry(instId, BAR, 20)
             if df_rsi is not None:
@@ -930,7 +913,7 @@ def run_prediction_cycle():
 
     for s in candidates:
         res, reason = predict_and_score(s)
-        if res:
+        if res is not None:
             valid.append(res)
             candidate_details.append(res)
             log(f"  [{len(valid)}] {res['symbol']}")
@@ -938,21 +921,21 @@ def run_prediction_cycle():
             log(f"      R²: {res['r_squared']:.2f} | 一致性: {res['consistency']:.2f} | 方向置信度: {res['direction_confidence']:.2f} | 得分: {res['score']:.4f}")
             log(f"      技术指标: {res['tech_msg']}")
         else:
-            # 从 reject_reason 中尝试提取多空评分（格式如 "多: 0.35/32.2, 空: 0.00/80.6"）
+            # 从 reject_reason 中尝试提取多空评分
             long_score = 0.0
             short_score = 0.0
             try:
-            # 匹配 "多: X/Y" 和 "空: X/Y"
-               import re
-               match_long = re.search(r'多:\s*[\d.]+/([\d.]+)', reason)
-               match_short = re.search(r'空:\s*[\d.]+/([\d.]+)', reason)
-               if match_long:
-                long_score = float(match_long.group(1))
+                import re
+                match_long = re.search(r'多:\s*[\d.]+/([\d.]+)', reason)
+                match_short = re.search(r'空:\s*[\d.]+/([\d.]+)', reason)
+                if match_long:
+                    long_score = float(match_long.group(1))
                 if match_short:
                     short_score = float(match_short.group(1))
-                except:
-                    pass
-               # 获取 ADX、ATR%、RSI（如果失败则用0）
+            except:
+                pass
+
+            # 获取 ADX、ATR%、RSI
             try:
                 adx = get_adx(s)
                 if adx is None: adx = 0
@@ -964,12 +947,12 @@ def run_prediction_cycle():
             except:
                 atr_pct = 0
             try:
-               df_rsi = fetch_klines_with_retry(s, BAR, 20)
-               rsi = compute_rsi(df_rsi['c'], RSI_PERIOD) if df_rsi is not None else 50
+                df_rsi = fetch_klines_with_retry(s, BAR, 20)
+                rsi = compute_rsi(df_rsi['c'], RSI_PERIOD) if df_rsi is not None else 50
             except:
-               rsi = 50
+                rsi = 50
 
-             candidate_details.append({
+            candidate_details.append({
                 "symbol": s,
                 "long_score": long_score,
                 "short_score": short_score,
@@ -1043,7 +1026,7 @@ def run_prediction_cycle():
         json.dump({k: v[0] for k, v in output_dict.items()}, f, indent=2, ensure_ascii=False)
     return output_dict
 
-# ==================== 9. 交易模块（保持原有完整逻辑，因篇幅限制此处仅做占位，实际请使用之前完整版） ====================
+# ==================== 9. 交易模块 ====================
 class OKXTrader:
     def __init__(self):
         self.exchange = self._init()
