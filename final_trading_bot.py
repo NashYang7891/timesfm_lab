@@ -96,6 +96,12 @@ VOLUME_SPIKE_RATIO = 2.5
 MIN_ATR_VALUE = 0.0005
 EMERGENCY_MOVE_PCT = 1.5
 
+# 开仓前安全检查参数（仅对逆势信号生效）
+MAX_DEVIATION_FROM_EMA_PCT = 2.5      # 价格偏离1小时EMA20超过2.5%则拒绝逆势开仓
+MAX_CANDLE_BODY_RATIO = 3.0           # 当前15分钟K线实体超过过去5根平均实体的3倍则拒绝
+MAX_VOLUME_SPIKE_RATIO = 3.0          # 成交量突增超过3倍则拒绝
+SAFETY_TREND_BAR = "1h"               # 安全检查使用的K线周期
+
 # ==================== 3. Telegram推送 ====================
 def push_telegram(content):
     if not TG_BOT_TOKEN: return False
@@ -1362,6 +1368,56 @@ class OKXTrader:
                 err(f"获取市场信息失败 {raw_symbol}: {e}")
         log(f"📋 设置待开仓信号: {len(self.pending_signals)} 个")
 
+    # ---------- 开仓前安全检查（仅对逆势信号）----------
+    def check_pre_open_safety(self, symbol, side, current_price, is_uptrend, is_downtrend):
+        """
+        开仓前安全检查，避免在突发消息或极端行情中反向开仓。
+        使用1小时EMA20判断价格偏离，使用15分钟K线判断实体和成交量。
+        返回 (is_safe, reason)
+        """
+        # 判断是否为顺势信号
+        is_with_trend = (side == 'long' and is_uptrend) or (side == 'short' and is_downtrend)
+        if is_with_trend:
+            return True, "顺势信号，跳过安全检查"
+
+        # 以下只针对逆势或震荡信号
+        # 1. 获取1小时K线数据，计算EMA20（用于价格偏离）
+        df_1h = fetch_klines_with_retry(symbol, SAFETY_TREND_BAR, 50)
+        if df_1h is None or len(df_1h) < 30:
+            return True, "1小时K线数据不足，跳过检查"
+        
+        closes_1h = df_1h['c'].astype(float)
+        ema20_1h = closes_1h.ewm(span=20, adjust=False).mean().iloc[-1]
+        if ema20_1h != 0:
+            deviation_pct = abs((current_price - ema20_1h) / ema20_1h) * 100
+            if deviation_pct > MAX_DEVIATION_FROM_EMA_PCT:
+                return False, f"逆势开仓但价格偏离1小时EMA20达 {deviation_pct:.2f}% > {MAX_DEVIATION_FROM_EMA_PCT}%，可能处于极端位置"
+
+        # 2. 获取15分钟K线数据，检查实体大小和成交量
+        df_15m = fetch_klines_with_retry(symbol, HIGHER_BAR, 20)
+        if df_15m is None or len(df_15m) < 20:
+            return True, "15分钟K线数据不足，跳过检查"
+        
+        # 检查最近一根15分钟K线实体是否过大
+        last_candle = df_15m.iloc[-1]
+        body = abs(last_candle['c'] - last_candle['o'])
+        prev_bodies = [abs(df_15m.iloc[-i-2]['c'] - df_15m.iloc[-i-2]['o']) for i in range(5)]
+        avg_body = np.mean(prev_bodies) if prev_bodies else body
+        if avg_body > 0:
+            body_ratio = body / avg_body
+            if body_ratio > MAX_CANDLE_BODY_RATIO:
+                return False, f"逆势开仓但15分钟K线实体是平均的 {body_ratio:.1f} 倍 > {MAX_CANDLE_BODY_RATIO}，可能为爆发行情"
+
+        # 检查成交量是否突增
+        volumes_15m = df_15m['v'].astype(float)
+        avg_vol = volumes_15m.iloc[-6:-1].mean()
+        current_vol = volumes_15m.iloc[-1]
+        if avg_vol > 0 and current_vol / avg_vol > MAX_VOLUME_SPIKE_RATIO:
+            return False, f"逆势开仓但成交量突增 {current_vol/avg_vol:.1f} 倍 > {MAX_VOLUME_SPIKE_RATIO}，可能为消息驱动"
+
+        return True, "安全检查通过"
+    # ---------- 安全检查结束 ----------
+
     def check_and_open_pending(self):
         if not self.pending_signals:
             return
@@ -1414,11 +1470,20 @@ class OKXTrader:
             log(f"⏸️ {symbol} 已有持仓 {current_positions[ccxt_symbol]}，拒绝重复开仓")
             return False
 
-        emergency, move_pct = check_emergency_move(symbol, self.exchange.fetch_ticker(symbol)['last'])
+        # 获取最新价格和趋势（用于安全检查）
+        try:
+            ticker = self.exchange.fetch_ticker(symbol)
+            current_price = ticker['last']
+        except:
+            log(f"❌ 无法获取 {symbol} 当前价格")
+            return False
+
+        emergency, move_pct = check_emergency_move(symbol, current_price)
         if emergency:
             ignore_price_position = True
             log(f"🚨 检测到紧急价格变动 {move_pct:.1f}%，将忽略实体位置检查直接开仓")
 
+        # 实体位置检查（如果不忽略）
         if not ignore_price_position:
             ok, msg = self.check_price_position_entity(symbol, side)
             if not ok:
@@ -1427,6 +1492,20 @@ class OKXTrader:
         else:
             log(f"🚀 忽略实体位置检查，因有利移动或紧急变动触发开仓 {symbol} {side}")
 
+        # ---------- 开仓前安全检查（仅对逆势信号）----------
+        ema20_15m, slope_15m = get_15min_trend(symbol)
+        is_uptrend = slope_15m is not None and slope_15m > 0.002
+        is_downtrend = slope_15m is not None and slope_15m < -0.002
+        safe, reason = self.check_pre_open_safety(symbol, side, current_price, is_uptrend, is_downtrend)
+        if not safe:
+            log(f"⛔ 开仓前安全检查拒绝 {symbol} {side}: {reason}")
+            push_telegram(f"⛔ 开仓前安全检查拒绝 {symbol} {side}: {reason}")
+            return False
+        else:
+            log(f"✅ 开仓前安全检查通过: {reason}")
+        # ---------- 安全检查结束 ----------
+
+        # 波动率自适应参数
         df_volatility = fetch_klines_with_retry(symbol, BAR, 30)
         if df_volatility is not None and len(df_volatility) >= 20:
             vol_profile, atr_pct = detect_volatility_profile(df_volatility)
@@ -1862,7 +1941,7 @@ def main():
     has_set_pending_this_cycle = False
 
     log("\n========== 全自动交易系统已启动 ==========")
-    push_telegram(f"🤖 交易机器人启动\nK线: {BAR} | 预测: {HORIZON}根 ({HORIZON*3}分钟) | 每{PREDICTION_INTERVAL/60:.1f}分钟一轮\n止盈: 动态止损+跟踪止损 | 最长持仓: 动态预测时间\n固定保证金: {MAX_SINGLE_TRADE_USDT} USDT/币\n流动性: 成交额≥{MIN_VOLUME_USDT/1_000_000:.0f}M, 市值≥{MIN_MARKET_CAP_USDT/1_000_000:.0f}M\n仓位模式: 逐仓 {LEVERAGE}x\n信号门槛: 置信度≥{MIN_DIRECTION_CONFIDENCE}, R²≥{MIN_R_SQUARED}\n技术指标: RSI周期{RSI_PERIOD} 多单<{RSI_LONG_THRESHOLD} 空单>{RSI_SHORT_THRESHOLD}; MACD({MACD_FAST},{MACD_SLOW},{MACD_SIGNAL})\n风控: 最多{MAX_CONCURRENT_POSITIONS}仓, 总保证金≤{MAX_TOTAL_MARGIN_RATIO*100}%权益\n开仓条件: 实体位置 或 价格有利移动 或 紧急动能信号\n多空相对评分制 | 动态预期收益率: 顺势0.3% / 逆势0.8%\n持仓时间: 基于TimesFM预测路径动态估算，时间到强制平仓")
+    push_telegram(f"🤖 交易机器人启动\nK线: {BAR} | 预测: {HORIZON}根 ({HORIZON*3}分钟) | 每{PREDICTION_INTERVAL/60:.1f}分钟一轮\n止盈: 动态止损+跟踪止损 | 最长持仓: 动态预测时间\n固定保证金: {MAX_SINGLE_TRADE_USDT} USDT/币\n流动性: 成交额≥{MIN_VOLUME_USDT/1_000_000:.0f}M, 市值≥{MIN_MARKET_CAP_USDT/1_000_000:.0f}M\n仓位模式: 逐仓 {LEVERAGE}x\n信号门槛: 置信度≥{MIN_DIRECTION_CONFIDENCE}, R²≥{MIN_R_SQUARED}\n技术指标: RSI周期{RSI_PERIOD} 多单<{RSI_LONG_THRESHOLD} 空单>{RSI_SHORT_THRESHOLD}; MACD({MACD_FAST},{MACD_SLOW},{MACD_SIGNAL})\n风控: 最多{MAX_CONCURRENT_POSITIONS}仓, 总保证金≤{MAX_TOTAL_MARGIN_RATIO*100}%权益\n开仓条件: 实体位置 或 价格有利移动 或 紧急动能信号\n多空相对评分制 | 动态预期收益率: 顺势0.3% / 逆势0.8%\n持仓时间: 基于TimesFM预测路径动态估算，时间到强制平仓\n开仓前安全检查: 仅对逆势信号检查1小时EMA20偏离(>{MAX_DEVIATION_FROM_EMA_PCT}%)、15分钟实体放大、成交量突增")
 
     while True:
         try:
