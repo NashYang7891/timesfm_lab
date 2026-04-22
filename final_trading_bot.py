@@ -455,12 +455,10 @@ def check_weak_rally(symbol, current_price, rsi):
         ema20 = get_ema20_3m(symbol)
         if ema20 is None:
             return False
-        # 触及容忍度
         if abs(current_price - ema20) / ema20 > 0.001:
             return False
         if rsi >= 50:
             return False
-        # 获取最近两根K线确认掉头
         df = fetch_klines_with_retry(symbol, BAR, 3)
         if df is None or len(df) < 2:
             return False
@@ -563,7 +561,6 @@ def calculate_bollinger_bands(symbol, period=20, std=2):
         return None, None
 
 def validate_signal(signal_type, symbol, current_price, rsi, adx, atr_pct, forecast_values=None):
-    # 1. 极端波动率拦截
     if atr_pct is not None and atr_pct > 5.0:
         return False, f"波动率过高 ({atr_pct:.2f}%)，暂停开仓"
 
@@ -593,7 +590,6 @@ def validate_signal(signal_type, symbol, current_price, rsi, adx, atr_pct, forec
             if forecast_low_min > current_price:
                 return False, f"TimesFM预测未来最低价 {forecast_low_min:.6f} 高于当前价，下跌空间不足"
 
-    # 成交量异常拦截
     try:
         df_vol = fetch_klines_with_retry(symbol, BAR, 21)
         if df_vol is not None and len(df_vol) >= 21:
@@ -673,7 +669,6 @@ def predict_and_score(instId):
         except:
             rsi_val = 50
 
-        # 动态预期收益率
         if is_uptrend:
             min_ret_long = TREND_FOLLOWING_RETURN
             min_ret_short = COUNTER_TREND_RETURN
@@ -690,7 +685,7 @@ def predict_and_score(instId):
         best_ret = 0
         reason_detail = ""
 
-        # 一致性反转逻辑（极低一致性时直接反向）
+        # 一致性反转逻辑
         if consistency < 0.2:
             if short_score > 0.4:
                 best_side = 'short'
@@ -698,7 +693,6 @@ def predict_and_score(instId):
                 best_conf = short_conf
                 best_ret = -abs(expected_return)
                 reason_detail = f"一致性极低({consistency:.2f})，强制空单扫描"
-                # 直接验证
                 valid, reject_reason = validate_signal('SHORT', instId, current_price, rsi_val, adx, atr_pct, forecast_values)
                 if not valid:
                     return None, f"信号过滤器拦截 (SHORT): {reject_reason}"
@@ -729,13 +723,9 @@ def predict_and_score(instId):
                 }
                 return result, ""
 
-        # 弱势反抽检测
         weak_rally = check_weak_rally(instId, current_price, rsi_val)
-
-        # 多空相对评分主逻辑
         diff = long_score - short_score
 
-        # 情况1：多单置信度极低 + 大趋势向下 -> 强制空单（降低门槛）
         if long_conf < 0.3 and is_downtrend:
             if short_score > 0.6:
                 best_side = 'short'
@@ -744,7 +734,6 @@ def predict_and_score(instId):
                 best_ret = -abs(expected_return)
                 reason_detail = f"多单置信度极低({long_conf:.2f})且趋势向下，强制空单(降门槛至0.6)"
 
-        # 情况2：弱势反抽且空单评分明显优于多单
         elif weak_rally and (short_score - long_score) > 0.15:
             best_side = 'short'
             best_score = short_score
@@ -752,7 +741,6 @@ def predict_and_score(instId):
             best_ret = -abs(expected_return)
             reason_detail = f"弱势反抽触发顺势补票空单 (短分{short_score:.1f} > 多分{long_score:.1f}+0.15)"
 
-        # 情况3：常规多空相对比较
         else:
             if diff > 0.2 and long_conf >= MIN_DIRECTION_CONFIDENCE and abs(expected_return) >= min_ret_long:
                 best_side = 'long'
@@ -767,7 +755,6 @@ def predict_and_score(instId):
                 best_ret = -abs(expected_return)
                 reason_detail = f"多空相对评分胜出 (diff={diff:.2f})"
             else:
-                # 额外尝试：即使diff不足0.2，但如果顺势方向且预期收益满足最低要求
                 if is_downtrend and short_conf >= MIN_DIRECTION_CONFIDENCE and abs(expected_return) >= min_ret_short:
                     best_side = 'short'
                     best_score = short_score
@@ -916,7 +903,6 @@ def run_prediction_cycle():
             log(f"      R²: {res['r_squared']:.2f} | 一致性: {res['consistency']:.2f} | 方向置信度: {res['direction_confidence']:.2f} | 得分: {res['score']:.4f}")
             log(f"      技术指标: {res['tech_msg']}")
         else:
-            # 从 reject_reason 中尝试提取多空评分
             long_score = 0.0
             short_score = 0.0
             try:
@@ -977,13 +963,8 @@ def run_prediction_cycle():
         push_telegram("❌ 本轮无高质量交易信号\n\n候选池及过滤原因见上方详情")
         return {}
 
+    # 排序后直接取前 FINAL_PICK_N 个，不再做得分 ≥95 的过滤
     df_results = pd.DataFrame(valid).sort_values("score", ascending=False)
-    df_results = df_results[df_results['score'] >= 95]
-    if df_results.empty:
-        log("❌ 无得分 ≥95 的高质量信号")
-        push_telegram("❌ 本轮无得分 ≥95 的高质量信号")
-        return {}
-
     top = df_results.head(FINAL_PICK_N)
 
     msg = ["✅ 高质量交易信号："]
@@ -1725,24 +1706,20 @@ class OKXTrader:
             expected_return = info.get('expected_return', 0)
             expected_pct = abs(expected_return * 100) if expected_return else 0
 
-            # 保险：开仓12分钟后，如果从未达到预期收益，强制平仓
             if hold_seconds >= 12 * 60 and not info.get('expected_met', False):
                 log(f"⏰ 开仓12分钟未达到预期收益，强制平仓: {sym} 盈亏 {pnl_percent:.2f}%, 预期 {expected_pct:.2f}%")
                 self.close_position(sym, reason=f"12分钟未达预期 (盈亏 {pnl_percent:.2f}%)")
                 closed_any = True
                 continue
 
-            # 判断方向是否正确
             direction_correct = (info['side'] == 'long' and expected_return > 0) or (info['side'] == 'short' and expected_return < 0)
 
-            # 如果方向正确且尚未达到预期收益，检查是否已达到
             if direction_correct and not info.get('expected_met', False):
                 if abs(pnl_percent) >= expected_pct:
                     info['expected_met'] = True
                     log(f"🎯 达到预期收益: {sym} 浮盈 {pnl_percent:.2f}% >= 预期 {expected_pct:.2f}%")
                     push_telegram(f"🎯 {sym} 达到预期收益 {expected_pct:.2f}%，激活跟踪止损")
 
-            # 跟踪止损：仅在达到预期收益后激活
             if info.get('expected_met', False):
                 trailing_stop = info.get('trailing_stop_pct', 1.0)
 
@@ -1773,7 +1750,6 @@ class OKXTrader:
                             closed_any = True
                             continue
 
-            # ATR 初始止损
             stop_price = info.get('stop_loss_price')
             if stop_price is not None:
                 if (info['side'] == 'long' and current_price <= stop_price) or (info['side'] == 'short' and current_price >= stop_price):
@@ -1840,7 +1816,6 @@ class OKXTrader:
 
 # ==================== 10. 主程序 ====================
 def main():
-    # 写入 PID 文件（用于监控）
     with open("/tmp/trading_bot.pid", "w") as f:
         f.write(str(os.getpid()))
     
@@ -1849,7 +1824,7 @@ def main():
     has_set_pending_this_cycle = False
 
     log("\n========== 全自动交易系统已启动 ==========")
-    push_telegram(f"🤖 交易机器人启动\nK线: {BAR} | 预测: {HORIZON}根 ({HORIZON*3}分钟) | 每{PREDICTION_INTERVAL/60:.1f}分钟一轮\n止盈: 动态止损+跟踪止损 | 最长持仓: {MAX_HOLD_SECONDS/60:.0f}分钟\n固定保证金: {MAX_SINGLE_TRADE_USDT} USDT/币\n流动性: 成交额≥{MIN_VOLUME_USDT/1_000_000:.0f}M, 市值≥{MIN_MARKET_CAP_USDT/1_000_000:.0f}M\n仓位模式: 逐仓 {LEVERAGE}x\n信号门槛: 得分≥95, 置信度≥{MIN_DIRECTION_CONFIDENCE}, R²≥{MIN_R_SQUARED}\n技术指标: RSI周期{RSI_PERIOD} 多单<{RSI_LONG_THRESHOLD} 空单>{RSI_SHORT_THRESHOLD}; MACD({MACD_FAST},{MACD_SLOW},{MACD_SIGNAL})\n风控: 最多{MAX_CONCURRENT_POSITIONS}仓, 总保证金≤{MAX_TOTAL_MARGIN_RATIO*100}%权益\n开仓条件: 实体位置 或 价格有利移动 或 紧急动能信号\n多空相对评分制 | 动态预期收益率: 顺势0.3% / 逆势0.8%")
+    push_telegram(f"🤖 交易机器人启动\nK线: {BAR} | 预测: {HORIZON}根 ({HORIZON*3}分钟) | 每{PREDICTION_INTERVAL/60:.1f}分钟一轮\n止盈: 动态止损+跟踪止损 | 最长持仓: {MAX_HOLD_SECONDS/60:.0f}分钟\n固定保证金: {MAX_SINGLE_TRADE_USDT} USDT/币\n流动性: 成交额≥{MIN_VOLUME_USDT/1_000_000:.0f}M, 市值≥{MIN_MARKET_CAP_USDT/1_000_000:.0f}M\n仓位模式: 逐仓 {LEVERAGE}x\n信号门槛: 置信度≥{MIN_DIRECTION_CONFIDENCE}, R²≥{MIN_R_SQUARED}\n技术指标: RSI周期{RSI_PERIOD} 多单<{RSI_LONG_THRESHOLD} 空单>{RSI_SHORT_THRESHOLD}; MACD({MACD_FAST},{MACD_SLOW},{MACD_SIGNAL})\n风控: 最多{MAX_CONCURRENT_POSITIONS}仓, 总保证金≤{MAX_TOTAL_MARGIN_RATIO*100}%权益\n开仓条件: 实体位置 或 价格有利移动 或 紧急动能信号\n多空相对评分制 | 动态预期收益率: 顺势0.3% / 逆势0.8%")
 
     while True:
         try:
