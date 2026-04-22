@@ -108,9 +108,9 @@ ENABLE_NEWS_MONITOR = True             # 是否启用新闻监控（使用免费
 NEWS_PAUSE_MINUTES = 5                 # 新闻出现后暂停交易多少分钟
 ENABLE_VOLUME_ANOMALY = True           # 是否启用成交异动检测
 VOLUME_ANOMALY_THRESHOLD = 5.0         # 成交量突增倍数（相对于过去5根K线平均）
-ENABLE_TREND_REVERSAL = True           # 是否启用趋势反转检测
+ENABLE_TREND_REVERSAL = True           # 是否启用趋势反转检测（增强版）
 ENABLE_PRICE_MOMENTUM_FILTER = True    # 是否启用价格动量过滤
-MOMENTUM_LIMIT_PCT = 2.0               # 最近3根K线累计涨幅/跌幅超过此值则拒绝顺势开仓
+MOMENTUM_LIMIT_PCT = 1.5               # 最近3根K线累计涨幅/跌幅超过1.5%则拒绝顺势开仓
 
 # 全局字典记录每个币种最后一次新闻影响的时间
 last_news_time = {}
@@ -692,25 +692,71 @@ def check_volume_anomaly(symbol, current_price):
 
 def check_trend_reversal(symbol, side, current_price, ema20_15m, slope_15m):
     """
-    检测趋势反转可能性。如果当前价格突破关键均线且动量变化，返回 (is_reversal, reason)
-    主要用于拒绝逆势开仓或警告。
+    增强版趋势反转检测。
+    对于多单：检测顶部反转形态（价格接近近期高点、出现阴线破位）
+    对于空单：检测底部反转形态（价格接近近期低点、出现阳线突破）
+    同时结合15分钟趋势转向。
+    返回 (is_reversal, reason)
     """
     if not ENABLE_TREND_REVERSAL:
         return False, ""
-    if ema20_15m is None or slope_15m is None:
-        return False, "无趋势数据"
-    # 获取最近3根15分钟K线，观察价格是否连续突破
-    df_15m = fetch_klines_with_retry(symbol, HIGHER_BAR, 5)
-    if df_15m is None or len(df_15m) < 4:
+    
+    # 获取最近10根15分钟K线（用于检测顶部/底部形态）
+    df_15m = fetch_klines_with_retry(symbol, HIGHER_BAR, 10)
+    if df_15m is None or len(df_15m) < 6:
         return False, "数据不足"
+    
     closes = df_15m['c'].astype(float)
-    # 计算最近2根K线的涨跌
-    recent_ret = (closes.iloc[-1] - closes.iloc[-2]) / closes.iloc[-2]
-    # 判断价格是否从下方突破EMA20（多单反转信号）
-    if side == 'long' and slope_15m < 0 and current_price > ema20_15m and recent_ret > 0.005:
-        return True, "价格突破下跌趋势的EMA20，可能反转向上"
-    if side == 'short' and slope_15m > 0 and current_price < ema20_15m and recent_ret < -0.005:
-        return True, "价格跌破上涨趋势的EMA20，可能反转向下"
+    highs = df_15m['h'].astype(float)
+    lows = df_15m['l'].astype(float)
+    opens = df_15m['o'].astype(float)
+    
+    # 最近5根K线的最高价和最低价（不包含当前未完成的K线，用前5根）
+    recent_high = highs.iloc[-6:-1].max()
+    recent_low = lows.iloc[-6:-1].min()
+    
+    # 最近一根K线是否收阴/收阳
+    last_candle_bearish = closes.iloc[-1] < opens.iloc[-1]  # 阴线
+    last_candle_bullish = closes.iloc[-1] > opens.iloc[-1]  # 阳线
+    
+    # 当前价格是否跌破上一根K线的最低价（破位）
+    price_below_prev_low = current_price < lows.iloc[-2]
+    # 当前价格是否突破上一根K线的最高价（突破）
+    price_above_prev_high = current_price > highs.iloc[-2]
+    
+    # 价格从近期高点的回落幅度（百分比）
+    if recent_high > 0:
+        drop_from_high = (recent_high - current_price) / recent_high * 100
+    else:
+        drop_from_high = 0
+    # 价格从近期低点的反弹幅度
+    if recent_low > 0:
+        rise_from_low = (current_price - recent_low) / recent_low * 100
+    else:
+        rise_from_low = 0
+    
+    # 多单反转检测（顶部形态）
+    if side == 'long':
+        # 条件1：价格从近期高点回落超过 1.5%（可调）
+        # 条件2：最近一根K线收阴
+        # 条件3：价格跌破上一根K线低点
+        if drop_from_high > 1.5 and last_candle_bearish and price_below_prev_low:
+            return True, f"检测到顶部反转形态：价格从高点{recent_high:.4f}回落{drop_from_high:.1f}%，出现阴线破位"
+        # 额外：如果15分钟趋势已经转为向下，且价格在EMA20下方
+        if slope_15m is not None and slope_15m < -0.001 and ema20_15m is not None and current_price < ema20_15m:
+            return True, f"15分钟趋势已转为向下，价格在EMA20下方，拒绝做多"
+    
+    # 空单反转检测（底部形态）
+    if side == 'short':
+        # 条件1：价格从近期低点反弹超过 1.5%
+        # 条件2：最近一根K线收阳
+        # 条件3：价格突破上一根K线高点
+        if rise_from_low > 1.5 and last_candle_bullish and price_above_prev_high:
+            return True, f"检测到底部反转形态：价格从低点{recent_low:.4f}反弹{rise_from_low:.1f}%，出现阳线突破"
+        # 额外：如果15分钟趋势已经转为向上，且价格在EMA20上方
+        if slope_15m is not None and slope_15m > 0.001 and ema20_15m is not None and current_price > ema20_15m:
+            return True, f"15分钟趋势已转为向上，价格在EMA20上方，拒绝做空"
+    
     return False, ""
 
 def check_price_momentum_filter(symbol, side, current_price):
@@ -917,7 +963,7 @@ def predict_and_score(instId):
         anomaly, vol_ratio_anom, anom_reason = check_volume_anomaly(instId, current_price)
         if anomaly:
             return None, f"成交异动拒绝: {anom_reason}"
-        # ---------- 新增：趋势反转检测 ----------
+        # ---------- 新增：趋势反转检测（增强版）----------
         reversal, reversal_reason = check_trend_reversal(instId, best_side, current_price, ema20_15m, slope_15m)
         if reversal:
             return None, f"趋势反转检测: {reversal_reason}"
@@ -2104,7 +2150,7 @@ def main():
     has_set_pending_this_cycle = False
 
     log("\n========== 全自动交易系统已启动 ==========")
-    push_telegram(f"🤖 交易机器人启动\nK线: {BAR} | 预测: {HORIZON}根 ({HORIZON*3}分钟) | 每{PREDICTION_INTERVAL/60:.1f}分钟一轮\n止盈: 动态止损+跟踪止损 | 最长持仓: 动态预测时间\n固定保证金: {MAX_SINGLE_TRADE_USDT} USDT/币\n流动性: 成交额≥{MIN_VOLUME_USDT/1_000_000:.0f}M, 市值≥{MIN_MARKET_CAP_USDT/1_000_000:.0f}M\n仓位模式: 逐仓 {LEVERAGE}x\n信号门槛: 置信度≥{MIN_DIRECTION_CONFIDENCE}, R²≥{MIN_R_SQUARED}\n技术指标: RSI周期{RSI_PERIOD} 多单<{RSI_LONG_THRESHOLD} 空单>{RSI_SHORT_THRESHOLD}; MACD({MACD_FAST},{MACD_SLOW},{MACD_SIGNAL})\n风控: 最多{MAX_CONCURRENT_POSITIONS}仓, 总保证金≤{MAX_TOTAL_MARGIN_RATIO*100}%权益\n开仓条件: 实体位置(顺势放宽)、有利移动、紧急动能、强势突破追单\n多空相对评分制 | 动态预期收益率: 顺势0.3% / 逆势0.8%\n持仓时间: 基于TimesFM预测路径动态估算，时间到强制平仓\n开仓前安全检查: 逆势信号检查1小时EMA20偏离、15分钟实体放大、成交量突增\n新增功能: 免费新闻监控(Free Crypto News API)、成交异动检测、趋势反转检测、价格动量过滤")
+    push_telegram(f"🤖 交易机器人启动\nK线: {BAR} | 预测: {HORIZON}根 ({HORIZON*3}分钟) | 每{PREDICTION_INTERVAL/60:.1f}分钟一轮\n止盈: 动态止损+跟踪止损 | 最长持仓: 动态预测时间\n固定保证金: {MAX_SINGLE_TRADE_USDT} USDT/币\n流动性: 成交额≥{MIN_VOLUME_USDT/1_000_000:.0f}M, 市值≥{MIN_MARKET_CAP_USDT/1_000_000:.0f}M\n仓位模式: 逐仓 {LEVERAGE}x\n信号门槛: 置信度≥{MIN_DIRECTION_CONFIDENCE}, R²≥{MIN_R_SQUARED}\n技术指标: RSI周期{RSI_PERIOD} 多单<{RSI_LONG_THRESHOLD} 空单>{RSI_SHORT_THRESHOLD}; MACD({MACD_FAST},{MACD_SLOW},{MACD_SIGNAL})\n风控: 最多{MAX_CONCURRENT_POSITIONS}仓, 总保证金≤{MAX_TOTAL_MARGIN_RATIO*100}%权益\n开仓条件: 实体位置(顺势放宽)、有利移动、紧急动能、强势突破追单\n多空相对评分制 | 动态预期收益率: 顺势0.3% / 逆势0.8%\n持仓时间: 基于TimesFM预测路径动态估算，时间到强制平仓\n开仓前安全检查: 逆势信号检查1小时EMA20偏离、15分钟实体放大、成交量突增\n新增功能: 免费新闻监控(Free Crypto News API)、成交异动检测、增强版趋势反转检测(顶部/底部形态)、价格动量过滤(1.5%)")
 
     while True:
         try:
