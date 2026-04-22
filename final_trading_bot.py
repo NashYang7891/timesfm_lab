@@ -46,8 +46,8 @@ HORIZON = 4
 
 TOP_N = 50
 FINAL_PICK_N = 3
-TREND_FOLLOWING_RETURN = 0.003
-COUNTER_TREND_RETURN = 0.008
+TREND_FOLLOWING_RETURN = 0.003   # 顺势 0.3%
+COUNTER_TREND_RETURN = 0.008     # 逆势 0.8%
 
 MIN_R_SQUARED = 0.2
 MIN_DIRECTION_CONFIDENCE = 0.65
@@ -608,7 +608,6 @@ def estimate_hold_minutes(forecast_values, current_price, target_return_pct, sid
     """
     if forecast_values is None or len(forecast_values) == 0:
         return HORIZON * 3
-    # 当前价格作为第0点
     price_seq = [current_price] + list(forecast_values[:HORIZON])
     bar_minutes = 3
     for i in range(1, len(price_seq)):
@@ -618,7 +617,6 @@ def estimate_hold_minutes(forecast_values, current_price, target_return_pct, sid
             ret = (current_price - price_seq[i]) / current_price
         if ret >= target_return_pct:
             return i * bar_minutes
-    # 未达到则取预测窗口终点
     return HORIZON * bar_minutes
 
 def predict_and_score(instId):
@@ -700,9 +698,9 @@ def predict_and_score(instId):
         best_ret = 0
         reason_detail = ""
 
-        # 一致性反转逻辑
+        # 一致性反转逻辑（增加收益检查）
         if consistency < 0.2:
-            if short_score > 0.4:
+            if short_score > 0.4 and abs(expected_return) >= 0.003:
                 best_side = 'short'
                 best_score = short_score
                 best_conf = short_conf
@@ -728,9 +726,7 @@ def predict_and_score(instId):
                             'long_entry_max': long_entry_max,
                             'short_entry_min': short_entry_min
                         }
-                # 估算持仓时间
-                target_pct = abs(best_ret)
-                hold_minutes = estimate_hold_minutes(forecast_values, current_price, target_pct, best_side)
+                hold_minutes = estimate_hold_minutes(forecast_values, current_price, abs(best_ret), best_side)
                 result = {
                     "symbol": instId, "signal": best_side, "expected_return": best_ret,
                     "r_squared": r_squared, "consistency": consistency, "direction_confidence": best_conf,
@@ -745,21 +741,25 @@ def predict_and_score(instId):
         weak_rally = check_weak_rally(instId, current_price, rsi_val)
         diff = long_score - short_score
 
+        # 情况1：多单置信度极低 + 大趋势向下 -> 强制空单（增加收益检查）
         if long_conf < 0.3 and is_downtrend:
-            if short_score > 0.6:
+            if short_score > 0.6 and abs(expected_return) >= min_ret_short:
                 best_side = 'short'
                 best_score = short_score
                 best_conf = short_conf
                 best_ret = -abs(expected_return)
                 reason_detail = f"多单置信度极低({long_conf:.2f})且趋势向下，强制空单(降门槛至0.6)"
 
+        # 情况2：弱势反抽且空单评分明显优于多单（增加收益检查）
         elif weak_rally and (short_score - long_score) > 0.15:
-            best_side = 'short'
-            best_score = short_score
-            best_conf = short_conf
-            best_ret = -abs(expected_return)
-            reason_detail = f"弱势反抽触发顺势补票空单 (短分{short_score:.1f} > 多分{long_score:.1f}+0.15)"
+            if abs(expected_return) >= TREND_FOLLOWING_RETURN:
+                best_side = 'short'
+                best_score = short_score
+                best_conf = short_conf
+                best_ret = -abs(expected_return)
+                reason_detail = f"弱势反抽触发顺势补票空单 (短分{short_score:.1f} > 多分{long_score:.1f}+0.15)"
 
+        # 情况3：常规多空相对比较
         else:
             if diff > 0.2 and long_conf >= MIN_DIRECTION_CONFIDENCE and abs(expected_return) >= min_ret_long:
                 best_side = 'long'
@@ -823,9 +823,7 @@ def predict_and_score(instId):
             else:
                 price_info = None
 
-        # 估算持仓时间
-        target_pct = abs(best_ret)
-        hold_minutes = estimate_hold_minutes(forecast_values, current_price, target_pct, best_side)
+        hold_minutes = estimate_hold_minutes(forecast_values, current_price, abs(best_ret), best_side)
 
         result = {
             "symbol": instId,
@@ -1891,10 +1889,17 @@ def main():
                         if available_balance < open_amount + 5:
                             push_telegram(f"⚠️ 可用余额不足 {open_amount} USDT（可用: {available_balance:.2f}），无法开仓")
                         else:
-                            signals_list = [(sym, sig, exp_ret, hold_min) for sym, (sig, exp_ret, hold_min) in signals_dict.items()]
-                            trader.set_pending_signals(signals_list, open_amount)
-                            has_set_pending_this_cycle = True
-                            push_telegram(f"📋 已设置待开仓信号，将在价格满足条件时开仓，保证金: {open_amount:.2f} USDT/币")
+                            # 过滤掉已有持仓的币种，避免重复信号开仓
+                            existing_symbols = set(trader.strategy_positions.keys())
+                            filtered_signals = {sym: (sig, exp_ret, hold_min) for sym, (sig, exp_ret, hold_min) in signals_dict.items() 
+                                                if sym not in existing_symbols}
+                            if filtered_signals:
+                                signals_list = [(sym, sig, exp_ret, hold_min) for sym, (sig, exp_ret, hold_min) in filtered_signals.items()]
+                                trader.set_pending_signals(signals_list, open_amount)
+                                has_set_pending_this_cycle = True
+                                push_telegram(f"📋 已设置待开仓信号，将在价格满足条件时开仓，保证金: {open_amount:.2f} USDT/币")
+                            else:
+                                push_telegram(f"⚠️ 所有信号币种均已有持仓，本次无新开仓")
 
             all_pos = trader.sync_positions()
             strategy_symbols = list(trader.strategy_positions.keys())
