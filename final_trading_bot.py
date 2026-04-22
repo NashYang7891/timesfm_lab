@@ -46,9 +46,9 @@ HORIZON = 4
 
 TOP_N = 50
 FINAL_PICK_N = 3
-BASE_MIN_EXPECTED_RETURN = 0.006
-TREND_FOLLOWING_THRESHOLD = 0.003
-COUNTER_TREND_THRESHOLD = 0.008
+# 动态预期收益率参数（原固定0.6%已废弃）
+TREND_FOLLOWING_RETURN = 0.003   # 顺势 0.3%
+COUNTER_TREND_RETURN = 0.008     # 逆势 0.8%
 
 MIN_R_SQUARED = 0.2
 MIN_DIRECTION_CONFIDENCE = 0.65
@@ -96,14 +96,6 @@ TRAILING_STOP_PCT = 2.0
 VOLUME_SPIKE_RATIO = 2.5
 MIN_ATR_VALUE = 0.0005
 EMERGENCY_MOVE_PCT = 1.5
-
-# ========= 多空对冲优化参数 =========
-MIN_SCORE_GAP = 0.3
-ADX_THRESHOLD = 25
-RSI_SHORT_LIMIT = 45
-VOLATILITY_MEDIAN_PERIOD = 20
-LONG_CONF_LOW_THRESHOLD = 40.0
-LONG_CONF_LOW_BARS = 3
 
 # ==================== 3. Telegram推送 ====================
 def push_telegram(content):
@@ -439,8 +431,46 @@ def get_adaptive_trading_params(bar_frame, volatility_profile):
         })
     return params
 
-# ==================== 7. 预测评分 + 多空对冲优化 ====================
-history_long_scores = {}
+# ==================== 7. 预测评分 + 多空相对评分制 ====================
+def get_ema20_3m(symbol):
+    """获取3m周期的EMA20"""
+    try:
+        df = fetch_klines_with_retry(symbol, BAR, 30)
+        if df is None or len(df) < 25:
+            return None
+        closes = df['c'].astype(float)
+        ema20 = closes.ewm(span=20, adjust=False).mean().iloc[-1]
+        return ema20
+    except:
+        return None
+
+def check_weak_rally(symbol, current_price, rsi):
+    """
+    检测弱势反抽：
+    1. 当前价格触及或非常接近3m EMA20（容忍0.1%）
+    2. RSI < 50
+    3. 价格刚从EMA20上方掉头向下（前一根收盘价 >= EMA20 且 当前收盘价 < EMA20）
+    """
+    try:
+        ema20 = get_ema20_3m(symbol)
+        if ema20 is None:
+            return False
+        # 触及容忍度
+        if abs(current_price - ema20) / ema20 > 0.001:
+            return False
+        if rsi >= 50:
+            return False
+        # 获取最近两根K线确认掉头
+        df = fetch_klines_with_retry(symbol, BAR, 3)
+        if df is None or len(df) < 2:
+            return False
+        prev_close = float(df['c'].iloc[-2])
+        curr_close = float(df['c'].iloc[-1])
+        if prev_close >= ema20 and curr_close < ema20:
+            return True
+        return False
+    except:
+        return False
 
 def compute_signal_score(symbol, side, current_price, expected_return, r_squared, consistency, vol_ratio, ema20_15m, slope_15m):
     base_conf = 0.7 * consistency + 0.3 * max(0.0, min(1.0, r_squared))
@@ -516,59 +546,6 @@ def get_adx(symbol, period=14):
     except Exception as e:
         err(f"计算ADX失败 {symbol}: {e}")
         return None
-
-def get_prev_high_2bars(symbol):
-    try:
-        df = fetch_klines_with_retry(symbol, BAR, 3)
-        if df is None or len(df) < 3:
-            return None
-        highs = df['h'].iloc[-3:-1].values
-        return max(highs) if len(highs) > 0 else None
-    except:
-        return None
-
-def get_ema9(symbol):
-    try:
-        df = fetch_klines_with_retry(symbol, BAR, 20)
-        if df is None or len(df) < 10:
-            return None
-        closes = df['c'].astype(float)
-        ema9 = closes.ewm(span=9, adjust=False).mean().iloc[-1]
-        return ema9
-    except:
-        return None
-
-def check_short_optimized(symbol, long_score, short_score, current_price, is_downtrend, adx, atr_pct, vol_median_pct, long_score_history):
-    adx_str = f"{adx:.1f}" if adx is not None else "N/A"
-    if adx is None or adx < ADX_THRESHOLD:
-        return False, f"ADX={adx_str} < {ADX_THRESHOLD}，趋势弱"
-    
-    atr_pct_str = f"{atr_pct:.2f}" if atr_pct is not None else "N/A"
-    vol_median_pct_str = f"{vol_median_pct:.2f}" if vol_median_pct is not None else "N/A"
-    if atr_pct is None or vol_median_pct is None or atr_pct <= vol_median_pct:
-        return False, f"波动率{atr_pct_str}% ≤ 中位数{vol_median_pct_str}%，市场横盘"
-    
-    if len(long_score_history) < LONG_CONF_LOW_BARS:
-        return False, f"历史多头评分不足{LONG_CONF_LOW_BARS}根"
-    if not all(score < LONG_CONF_LOW_THRESHOLD for score in long_score_history[-LONG_CONF_LOW_BARS:]):
-        return False, f"多头评分未连续{LONG_CONF_LOW_BARS}根低于{LONG_CONF_LOW_THRESHOLD}"
-    
-    prev_high = get_prev_high_2bars(symbol)
-    ema9 = get_ema9(symbol)
-    if prev_high is None or ema9 is None:
-        return False, "无法获取前高或EMA9"
-    if current_price >= prev_high:
-        return False, f"当前价{current_price:.6f} ≥ 前高{prev_high:.6f}"
-    if current_price >= ema9:
-        return False, f"当前价{current_price:.6f} ≥ EMA9{ema9:.6f}"
-    
-    score_gap = short_score - long_score
-    if score_gap < MIN_SCORE_GAP:
-        return False, f"多空梯度差值{score_gap:.2f} < {MIN_SCORE_GAP}"
-    if not is_downtrend:
-        return False, "15分钟趋势并非下降"
-    
-    return True, f"通过所有优化条件 (gap={score_gap:.2f}, ADX={adx_str}, 波动率{atr_pct_str}%>{vol_median_pct_str}%)"
 
 def calculate_bollinger_bands(symbol, period=20, std=2):
     try:
@@ -682,118 +659,142 @@ def predict_and_score(instId):
         consistency = np.sum(np.sign(diffs) == direction) / len(diffs)
 
         ema20_15m, slope_15m = get_15min_trend(instId)
-        is_downtrend = slope_15m is not None and slope_15m < -0.002
         is_uptrend = slope_15m is not None and slope_15m > 0.002
+        is_downtrend = slope_15m is not None and slope_15m < -0.002
 
         long_conf, long_score = compute_signal_score(instId, 'long', current_price, expected_return, r_squared, consistency, vol_ratio, ema20_15m, slope_15m)
         short_conf, short_score = compute_signal_score(instId, 'short', current_price, -expected_return, r_squared, consistency, vol_ratio, ema20_15m, slope_15m)
 
-        global history_long_scores
-        if instId not in history_long_scores:
-            history_long_scores[instId] = []
-        history_long_scores[instId].append(long_score)
-        if len(history_long_scores[instId]) > LONG_CONF_LOW_BARS + 5:
-            history_long_scores[instId] = history_long_scores[instId][-(LONG_CONF_LOW_BARS+5):]
-
         adx = get_adx(instId)
         atr_pct = get_atr_percent(instId)
-        vol_median_pct = None
-        if atr_pct is not None:
-            df_atr = fetch_klines_with_retry(instId, BAR, VOLATILITY_MEDIAN_PERIOD+10)
-            if df_atr is not None and len(df_atr) >= VOLATILITY_MEDIAN_PERIOD:
-                atr_list = []
-                for i in range(len(df_atr)-ATR_PERIOD):
-                    sub = df_atr.iloc[i:i+ATR_PERIOD]
-                    high = sub['h'].values
-                    low = sub['l'].values
-                    close = sub['c'].values
-                    tr = np.maximum(high[1:] - low[1:],
-                                    np.abs(high[1:] - close[:-1]),
-                                    np.abs(low[1:] - close[:-1]))
-                    atr_val = np.mean(tr)
-                    atr_pct_val = atr_val / close[-1] * 100
-                    atr_list.append(atr_pct_val)
-                if len(atr_list) >= VOLATILITY_MEDIAN_PERIOD:
-                    vol_median_pct = np.median(atr_list[-VOLATILITY_MEDIAN_PERIOD:])
+        try:
+            df_rsi = fetch_klines_with_retry(instId, BAR, 20)
+            rsi_val = compute_rsi(df_rsi['c'], RSI_PERIOD) if df_rsi is not None else 50
+        except:
+            rsi_val = 50
 
-        if is_downtrend:
-            min_ret_long = COUNTER_TREND_THRESHOLD
-            min_ret_short = TREND_FOLLOWING_THRESHOLD
-        elif is_uptrend:
-            min_ret_long = TREND_FOLLOWING_THRESHOLD
-            min_ret_short = COUNTER_TREND_THRESHOLD
+        # 动态预期收益率
+        if is_uptrend:
+            min_ret_long = TREND_FOLLOWING_RETURN
+            min_ret_short = COUNTER_TREND_RETURN
+        elif is_downtrend:
+            min_ret_long = COUNTER_TREND_RETURN
+            min_ret_short = TREND_FOLLOWING_RETURN
         else:
-            min_ret_long = BASE_MIN_EXPECTED_RETURN
-            min_ret_short = BASE_MIN_EXPECTED_RETURN
-
-        short_optimized_pass = False
-        short_optimized_reason = ""
-        if is_downtrend and long_score < LONG_CONF_LOW_THRESHOLD:
-            short_optimized_pass, short_optimized_reason = check_short_optimized(
-                instId, long_score, short_score, current_price, is_downtrend,
-                adx, atr_pct, vol_median_pct, history_long_scores.get(instId, [])
-            )
+            min_ret_long = TREND_FOLLOWING_RETURN
+            min_ret_short = TREND_FOLLOWING_RETURN
 
         best_side = None
         best_score = 0
         best_conf = 0
         best_ret = 0
+        reason_detail = ""
 
-        # 空单候选
-        if short_optimized_pass or (short_conf >= MIN_DIRECTION_CONFIDENCE and abs(expected_return) >= min_ret_short):
-            try:
-                df_rsi = fetch_klines_with_retry(instId, BAR, 20)
-                if df_rsi is not None and len(df_rsi) >= 14:
-                    rsi_val = compute_rsi(df_rsi['c'], RSI_PERIOD)
-                    if rsi_val >= RSI_SHORT_LIMIT:
-                        raise ValueError(f"RSI={rsi_val:.1f} ≥ {RSI_SHORT_LIMIT}，不满足空单条件")
-                else:
-                    raise ValueError("无法获取RSI")
-            except Exception:
-                short_optimized_pass = False
-                short_conf = 0
-            if short_optimized_pass or short_conf >= MIN_DIRECTION_CONFIDENCE:
+        # 一致性反转逻辑（极低一致性时直接反向）
+        if consistency < 0.2:
+            if short_score > 0.4:
                 best_side = 'short'
                 best_score = short_score
                 best_conf = short_conf
                 best_ret = -abs(expected_return)
+                reason_detail = f"一致性极低({consistency:.2f})，强制空单扫描"
+                # 直接验证
+                valid, reject_reason = validate_signal('SHORT', instId, current_price, rsi_val, adx, atr_pct, forecast_values)
+                if not valid:
+                    return None, f"信号过滤器拦截 (SHORT): {reject_reason}"
+                candle = fetch_previous_candle(instId)
+                price_info = None
+                if candle:
+                    open_p, high, low, close = candle
+                    body_top = max(open_p, close)
+                    body_bottom = min(open_p, close)
+                    body_len = body_top - body_bottom
+                    if body_len > 0:
+                        long_entry_max = body_bottom + body_len * PRICE_POSITION_RATIO
+                        short_entry_min = body_top - body_len * PRICE_POSITION_RATIO
+                        price_info = {
+                            'current_price': current_price,
+                            'body_top': body_top,
+                            'body_bottom': body_bottom,
+                            'long_entry_max': long_entry_max,
+                            'short_entry_min': short_entry_min
+                        }
+                result = {
+                    "symbol": instId, "signal": best_side, "expected_return": best_ret,
+                    "r_squared": r_squared, "consistency": consistency, "direction_confidence": best_conf,
+                    "score": best_score, "last_price": current_price, "price_info": price_info,
+                    "tech_msg": reason_detail, "long_score": long_score, "short_score": short_score,
+                    "adx": adx if adx else 0, "atr_pct": atr_pct if atr_pct else 0,
+                    "vol_median_pct": 0, "rsi": rsi_val
+                }
+                return result, ""
 
-        # 多单候选
-        if long_conf >= MIN_DIRECTION_CONFIDENCE and abs(expected_return) >= min_ret_long:
-            if best_side is None or long_score > best_score:
+        # 弱势反抽检测
+        weak_rally = check_weak_rally(instId, current_price, rsi_val)
+
+        # 多空相对评分主逻辑
+        diff = long_score - short_score
+
+        # 情况1：多单置信度极低 + 大趋势向下 -> 强制空单（降低门槛）
+        if long_conf < 0.3 and is_downtrend:
+            if short_score > 0.6:
+                best_side = 'short'
+                best_score = short_score
+                best_conf = short_conf
+                best_ret = -abs(expected_return)
+                reason_detail = f"多单置信度极低({long_conf:.2f})且趋势向下，强制空单(降门槛至0.6)"
+
+        # 情况2：弱势反抽且空单评分明显优于多单
+        elif weak_rally and (short_score - long_score) > 0.15:
+            best_side = 'short'
+            best_score = short_score
+            best_conf = short_conf
+            best_ret = -abs(expected_return)
+            reason_detail = f"弱势反抽触发顺势补票空单 (短分{short_score:.1f} > 多分{long_score:.1f}+0.15)"
+
+        # 情况3：常规多空相对比较
+        else:
+            if diff > 0.2 and long_conf >= MIN_DIRECTION_CONFIDENCE and abs(expected_return) >= min_ret_long:
                 best_side = 'long'
                 best_score = long_score
                 best_conf = long_conf
                 best_ret = abs(expected_return)
-
-        # 信号过滤器拦截
-        if best_side is not None:
-            try:
-                df_rsi = fetch_klines_with_retry(instId, BAR, 20)
-                if df_rsi is not None and len(df_rsi) >= 14:
-                    rsi_filter = compute_rsi(df_rsi['c'], RSI_PERIOD)
-                else:
-                    rsi_filter = 50
-            except:
-                rsi_filter = 50
-
-            valid, reject_reason = validate_signal(
-                signal_type=best_side.upper(),
-                symbol=instId,
-                current_price=current_price,
-                rsi=rsi_filter,
-                adx=adx,
-                atr_pct=atr_pct,
-                forecast_values=forecast_values
-            )
-            if not valid:
-                return None, f"信号过滤器拦截 ({best_side.upper()}): {reject_reason}"
+                reason_detail = f"多空相对评分胜出 (diff={diff:.2f})"
+            elif diff < -0.2 and short_conf >= MIN_DIRECTION_CONFIDENCE and abs(expected_return) >= min_ret_short:
+                best_side = 'short'
+                best_score = short_score
+                best_conf = short_conf
+                best_ret = -abs(expected_return)
+                reason_detail = f"多空相对评分胜出 (diff={diff:.2f})"
+            else:
+                # 额外尝试：即使diff不足0.2，但如果顺势方向且预期收益满足最低要求
+                if is_downtrend and short_conf >= MIN_DIRECTION_CONFIDENCE and abs(expected_return) >= min_ret_short:
+                    best_side = 'short'
+                    best_score = short_score
+                    best_conf = short_conf
+                    best_ret = -abs(expected_return)
+                    reason_detail = f"顺势空单（diff={diff:.2f}不足但趋势配合）"
+                elif is_uptrend and long_conf >= MIN_DIRECTION_CONFIDENCE and abs(expected_return) >= min_ret_long:
+                    best_side = 'long'
+                    best_score = long_score
+                    best_conf = long_conf
+                    best_ret = abs(expected_return)
+                    reason_detail = f"顺势多单（diff={diff:.2f}不足但趋势配合）"
 
         if best_side is None:
-            reject_reason = f"多空均未通过阈值 (多: {long_conf:.2f}/{long_score:.1f}, 空: {short_conf:.2f}/{short_score:.1f})"
-            if is_downtrend and long_score < LONG_CONF_LOW_THRESHOLD:
-                reject_reason += f" | 空单优化过滤: {short_optimized_reason}"
-            return None, reject_reason
+            return None, f"多空均未通过动态评分 (多: {long_conf:.2f}/{long_score:.1f}, 空: {short_conf:.2f}/{short_score:.1f}, diff={diff:.2f})"
+
+        valid, reject_reason = validate_signal(
+            signal_type=best_side.upper(),
+            symbol=instId,
+            current_price=current_price,
+            rsi=rsi_val,
+            adx=adx,
+            atr_pct=atr_pct,
+            forecast_values=forecast_values
+        )
+        if not valid:
+            return None, f"信号过滤器拦截 ({best_side.upper()}): {reject_reason}"
 
         candle = fetch_previous_candle(instId)
         if candle is None:
@@ -826,20 +827,14 @@ def predict_and_score(instId):
             "score": best_score,
             "last_price": current_price,
             "price_info": price_info,
-            "tech_msg": f"多空对冲评分 (多{long_score:.1f}/空{short_score:.1f})，选择{best_side}",
+            "tech_msg": f"动态多空评分 (多{long_score:.1f}/空{short_score:.1f})，选择{best_side}，原因：{reason_detail}",
             "long_score": long_score,
             "short_score": short_score,
-            "adx": adx if adx is not None else 0,
-            "atr_pct": atr_pct if atr_pct is not None else 0,
-            "vol_median_pct": vol_median_pct if vol_median_pct is not None else 0,
-            "rsi": None,
+            "adx": adx if adx else 0,
+            "atr_pct": atr_pct if atr_pct else 0,
+            "vol_median_pct": 0,
+            "rsi": rsi_val,
         }
-        try:
-            df_rsi = fetch_klines_with_retry(instId, BAR, 20)
-            if df_rsi is not None:
-                result["rsi"] = compute_rsi(df_rsi['c'], RSI_PERIOD)
-        except:
-            result["rsi"] = 50
         return result, ""
 
     except Exception as e:
@@ -935,7 +930,6 @@ def run_prediction_cycle():
             except:
                 pass
 
-            # 获取 ADX、ATR%、RSI
             try:
                 adx = get_adx(s)
                 if adx is None: adx = 0
@@ -984,18 +978,14 @@ def run_prediction_cycle():
         return {}
 
     df_results = pd.DataFrame(valid).sort_values("score", ascending=False)
-    df_results = pd.DataFrame(valid).sort_values("score", ascending=False)
-    # 去掉分数过滤
+    df_results = df_results[df_results['score'] >= 95]
     if df_results.empty:
-       log("❌ 无任何信号")
-       push_telegram("❌ 本轮无任何信号")
-       return {}
+        log("❌ 无得分 ≥95 的高质量信号")
+        push_telegram("❌ 本轮无得分 ≥95 的高质量信号")
+        return {}
 
     top = df_results.head(FINAL_PICK_N)
-    # 可选的警告信息
-    if top.iloc[0]['score'] < 60:
-       push_telegram(f"⚠️ 当前最佳信号得分仅 {top.iloc[0]['score']:.1f}，请关注风险")
-    
+
     msg = ["✅ 高质量交易信号："]
     for _, row in top.iterrows():
         symbol = row['symbol']
@@ -1859,7 +1849,7 @@ def main():
     has_set_pending_this_cycle = False
 
     log("\n========== 全自动交易系统已启动 ==========")
-    push_telegram(f"🤖 交易机器人启动\nK线: {BAR} | 预测: {HORIZON}根 ({HORIZON*3}分钟) | 每{PREDICTION_INTERVAL/60:.1f}分钟一轮\n止盈: 动态止损+跟踪止损 | 最长持仓: {MAX_HOLD_SECONDS/60:.0f}分钟\n固定保证金: {MAX_SINGLE_TRADE_USDT} USDT/币\n流动性: 成交额≥{MIN_VOLUME_USDT/1_000_000:.0f}M, 市值≥{MIN_MARKET_CAP_USDT/1_000_000:.0f}M\n仓位模式: 逐仓 {LEVERAGE}x\n信号门槛: 得分≥95, 置信度≥{MIN_DIRECTION_CONFIDENCE}, R²≥{MIN_R_SQUARED}\n技术指标: RSI周期{RSI_PERIOD} 多单<{RSI_LONG_THRESHOLD} 空单>{RSI_SHORT_THRESHOLD}; MACD({MACD_FAST},{MACD_SLOW},{MACD_SIGNAL})\n风控: 最多{MAX_CONCURRENT_POSITIONS}仓, 总保证金≤{MAX_TOTAL_MARGIN_RATIO*100}%权益\n开仓条件: 实体位置 或 价格有利移动 或 紧急动能信号\n多空对冲优化: ADX>{ADX_THRESHOLD}, 波动率>中位数, 多头连续{LONG_CONF_LOW_BARS}根低于{LONG_CONF_LOW_THRESHOLD}, 梯度差>{MIN_SCORE_GAP}, RSI<{RSI_SHORT_LIMIT}")
+    push_telegram(f"🤖 交易机器人启动\nK线: {BAR} | 预测: {HORIZON}根 ({HORIZON*3}分钟) | 每{PREDICTION_INTERVAL/60:.1f}分钟一轮\n止盈: 动态止损+跟踪止损 | 最长持仓: {MAX_HOLD_SECONDS/60:.0f}分钟\n固定保证金: {MAX_SINGLE_TRADE_USDT} USDT/币\n流动性: 成交额≥{MIN_VOLUME_USDT/1_000_000:.0f}M, 市值≥{MIN_MARKET_CAP_USDT/1_000_000:.0f}M\n仓位模式: 逐仓 {LEVERAGE}x\n信号门槛: 得分≥95, 置信度≥{MIN_DIRECTION_CONFIDENCE}, R²≥{MIN_R_SQUARED}\n技术指标: RSI周期{RSI_PERIOD} 多单<{RSI_LONG_THRESHOLD} 空单>{RSI_SHORT_THRESHOLD}; MACD({MACD_FAST},{MACD_SLOW},{MACD_SIGNAL})\n风控: 最多{MAX_CONCURRENT_POSITIONS}仓, 总保证金≤{MAX_TOTAL_MARGIN_RATIO*100}%权益\n开仓条件: 实体位置 或 价格有利移动 或 紧急动能信号\n多空相对评分制 | 动态预期收益率: 顺势0.3% / 逆势0.8%")
 
     while True:
         try:
