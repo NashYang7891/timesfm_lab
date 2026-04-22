@@ -104,9 +104,8 @@ MAX_VOLUME_SPIKE_RATIO = 3.0          # 成交量突增超过3倍则拒绝
 SAFETY_TREND_BAR = "1h"               # 安全检查使用的K线周期
 
 # ==================== 新增功能参数 ====================
-ENABLE_NEWS_MONITOR = True             # 是否启用新闻监控
+ENABLE_NEWS_MONITOR = True             # 是否启用新闻监控（使用免费 Free Crypto News API）
 NEWS_PAUSE_MINUTES = 5                 # 新闻出现后暂停交易多少分钟
-CRYPTOPANIC_API_KEY = ""               # 可选，免费版不需要key（但可能有限制）
 ENABLE_VOLUME_ANOMALY = True           # 是否启用成交异动检测
 VOLUME_ANOMALY_THRESHOLD = 5.0         # 成交量突增倍数（相对于过去5根K线平均）
 ENABLE_TREND_REVERSAL = True           # 是否启用趋势反转检测
@@ -162,7 +161,7 @@ def _build_timesfm_model():
 model = _build_timesfm_model()
 log("✅ 模型加载完成")
 
-# ==================== 5. OKX数据获取（原有函数保持不变） ====================
+# ==================== 5. OKX数据获取 ====================
 def get_all_swap_contracts():
     try:
         url = "https://www.okx.com/api/v5/public/instruments"
@@ -247,7 +246,7 @@ def calculate_volatility(prices):
     ret = np.diff(prices) / prices[:-1]
     return np.std(ret) * 1000
 
-# ==================== 6. 技术指标计算（原有函数保持不变） ====================
+# ==================== 6. 技术指标计算 ====================
 def compute_rsi(series, period=14):
     delta = series.diff()
     gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
@@ -450,110 +449,7 @@ def get_adaptive_trading_params(bar_frame, volatility_profile):
         })
     return params
 
-# ==================== 7. 新增辅助功能函数 ====================
-def check_news_impact(symbol):
-    """
-    查询 CryptoPanic 新闻聚合，判断该币种是否有高影响力新闻。
-    返回 (is_impacted, news_title)
-    """
-    if not ENABLE_NEWS_MONITOR:
-        return False, ""
-    # 提取币种名称（去掉 -USDT-SWAP 后缀）
-    coin = symbol.split('-')[0]
-    try:
-        url = f"https://cryptopanic.com/api/v1/posts/?auth_token={CRYPTOPANIC_API_KEY}&currencies={coin}&filter=important"
-        resp = requests.get(url, timeout=5)
-        if resp.status_code == 200:
-            data = resp.json()
-            # 检查最近 NEWS_PAUSE_MINUTES 分钟内是否有重要新闻
-            now = datetime.now()
-            for post in data.get('results', []):
-                published = datetime.strptime(post['published_at'], "%Y-%m-%dT%H:%M:%SZ")
-                if (now - published).total_seconds() < NEWS_PAUSE_MINUTES * 60:
-                    if post.get('kind') in ['news', 'important']:
-                        return True, post.get('title', '')
-        return False, ""
-    except Exception as e:
-        log(f"新闻API调用失败 {symbol}: {e}")
-        return False, ""
-
-def check_volume_anomaly(symbol, current_price):
-    """
-    检测成交异动：最近一根K线成交量是否超过过去5根平均成交量的 N 倍
-    返回 (is_anomaly, ratio, description)
-    """
-    if not ENABLE_VOLUME_ANOMALY:
-        return False, 1.0, ""
-    try:
-        df = fetch_klines_with_retry(symbol, BAR, 10)
-        if df is None or len(df) < 6:
-            return False, 1.0, "数据不足"
-        volumes = df['v'].astype(float)
-        avg_vol = volumes.iloc[-6:-1].mean()  # 过去5根平均
-        current_vol = volumes.iloc[-1]
-        if avg_vol == 0:
-            return False, 1.0, "平均成交量为0"
-        ratio = current_vol / avg_vol
-        if ratio > VOLUME_ANOMALY_THRESHOLD:
-            # 同时检查价格变动是否剧烈（超过1%）
-            closes = df['c'].astype(float)
-            price_change = abs((closes.iloc[-1] - closes.iloc[-2]) / closes.iloc[-2] * 100)
-            if price_change > 1.0:
-                return True, ratio, f"成交量突增{ratio:.1f}倍，价格波动{price_change:.1f}%"
-        return False, ratio, ""
-    except Exception as e:
-        log(f"成交异动检测异常 {symbol}: {e}")
-        return False, 1.0, ""
-
-def check_trend_reversal(symbol, side, current_price, ema20_15m, slope_15m):
-    """
-    检测趋势反转可能性。如果当前价格突破关键均线且动量变化，返回 (is_reversal, reason)
-    主要用于拒绝逆势开仓或警告。
-    """
-    if not ENABLE_TREND_REVERSAL:
-        return False, ""
-    if ema20_15m is None or slope_15m is None:
-        return False, "无趋势数据"
-    # 获取最近3根15分钟K线，观察价格是否连续突破
-    df_15m = fetch_klines_with_retry(symbol, HIGHER_BAR, 5)
-    if df_15m is None or len(df_15m) < 4:
-        return False, "数据不足"
-    closes = df_15m['c'].astype(float)
-    # 计算最近2根K线的涨跌
-    recent_ret = (closes.iloc[-1] - closes.iloc[-2]) / closes.iloc[-2]
-    # 判断价格是否从下方突破EMA20（多单反转信号）
-    if side == 'long' and slope_15m < 0 and current_price > ema20_15m and recent_ret > 0.005:
-        return True, "价格突破下跌趋势的EMA20，可能反转向上"
-    if side == 'short' and slope_15m > 0 and current_price < ema20_15m and recent_ret < -0.005:
-        return True, "价格跌破上涨趋势的EMA20，可能反转向下"
-    return False, ""
-
-def check_price_momentum_filter(symbol, side, current_price):
-    """
-    价格动量过滤：对于顺势信号，如果最近3根K线累计涨跌幅已经超过 MOMENTUM_LIMIT_PCT，
-    则拒绝开仓（避免追高/追低）。
-    """
-    if not ENABLE_PRICE_MOMENTUM_FILTER:
-        return True, ""
-    try:
-        df = fetch_klines_with_retry(symbol, BAR, 5)
-        if df is None or len(df) < 4:
-            return True, "数据不足"
-        closes = df['c'].astype(float)
-        # 计算最近3根K线的累计收益率
-        start_price = closes.iloc[-4]
-        end_price = closes.iloc[-1]
-        total_ret = (end_price - start_price) / start_price * 100
-        if side == 'long' and total_ret > MOMENTUM_LIMIT_PCT:
-            return False, f"最近3根K线已累计上涨{total_ret:.2f}% > {MOMENTUM_LIMIT_PCT}%，追高风险大"
-        if side == 'short' and total_ret < -MOMENTUM_LIMIT_PCT:
-            return False, f"最近3根K线已累计下跌{abs(total_ret):.2f}% > {MOMENTUM_LIMIT_PCT}%，追跌风险大"
-        return True, ""
-    except Exception as e:
-        log(f"动量过滤异常 {symbol}: {e}")
-        return True, ""
-
-# ==================== 8. 预测评分 + 多空相对评分制（原有核心逻辑，加入新过滤器） ====================
+# ==================== 7. 预测评分 + 多空相对评分制 ====================
 def get_ema20_3m(symbol):
     try:
         df = fetch_klines_with_retry(symbol, BAR, 30)
@@ -734,6 +630,113 @@ def estimate_hold_minutes(forecast_values, current_price, target_return_pct, sid
         if ret >= target_return_pct:
             return i * bar_minutes
     return HORIZON * bar_minutes
+
+# ==================== 新增辅助功能函数 ====================
+def check_news_impact(symbol):
+    """
+    使用完全免费的 Free Crypto News API 查询新闻（无需 API Key）
+    返回 (is_impacted, news_title)
+    """
+    if not ENABLE_NEWS_MONITOR:
+        return False, ""
+    # 提取币种名称（去掉 -USDT-SWAP 后缀）
+    coin = symbol.split('-')[0]
+    try:
+        url = f"https://api.freecryptonews.com/v1/news?symbol={coin}&limit=5"
+        resp = requests.get(url, timeout=5)
+        if resp.status_code == 200:
+            data = resp.json()
+            # 检查最近 NEWS_PAUSE_MINUTES 分钟内的新闻
+            now = datetime.now()
+            for article in data.get('articles', []):
+                published_str = article.get('published_at')
+                if published_str:
+                    try:
+                        published = datetime.fromisoformat(published_str.replace('Z', '+00:00'))
+                        if (now - published).total_seconds() < NEWS_PAUSE_MINUTES * 60:
+                            return True, article.get('title', '')
+                    except:
+                        pass
+        return False, ""
+    except Exception as e:
+        log(f"新闻API调用失败 {symbol}: {e}")
+        return False, ""
+
+def check_volume_anomaly(symbol, current_price):
+    """
+    检测成交异动：最近一根K线成交量是否超过过去5根平均成交量的 N 倍
+    返回 (is_anomaly, ratio, description)
+    """
+    if not ENABLE_VOLUME_ANOMALY:
+        return False, 1.0, ""
+    try:
+        df = fetch_klines_with_retry(symbol, BAR, 10)
+        if df is None or len(df) < 6:
+            return False, 1.0, "数据不足"
+        volumes = df['v'].astype(float)
+        avg_vol = volumes.iloc[-6:-1].mean()  # 过去5根平均
+        current_vol = volumes.iloc[-1]
+        if avg_vol == 0:
+            return False, 1.0, "平均成交量为0"
+        ratio = current_vol / avg_vol
+        if ratio > VOLUME_ANOMALY_THRESHOLD:
+            # 同时检查价格变动是否剧烈（超过1%）
+            closes = df['c'].astype(float)
+            price_change = abs((closes.iloc[-1] - closes.iloc[-2]) / closes.iloc[-2] * 100)
+            if price_change > 1.0:
+                return True, ratio, f"成交量突增{ratio:.1f}倍，价格波动{price_change:.1f}%"
+        return False, ratio, ""
+    except Exception as e:
+        log(f"成交异动检测异常 {symbol}: {e}")
+        return False, 1.0, ""
+
+def check_trend_reversal(symbol, side, current_price, ema20_15m, slope_15m):
+    """
+    检测趋势反转可能性。如果当前价格突破关键均线且动量变化，返回 (is_reversal, reason)
+    主要用于拒绝逆势开仓或警告。
+    """
+    if not ENABLE_TREND_REVERSAL:
+        return False, ""
+    if ema20_15m is None or slope_15m is None:
+        return False, "无趋势数据"
+    # 获取最近3根15分钟K线，观察价格是否连续突破
+    df_15m = fetch_klines_with_retry(symbol, HIGHER_BAR, 5)
+    if df_15m is None or len(df_15m) < 4:
+        return False, "数据不足"
+    closes = df_15m['c'].astype(float)
+    # 计算最近2根K线的涨跌
+    recent_ret = (closes.iloc[-1] - closes.iloc[-2]) / closes.iloc[-2]
+    # 判断价格是否从下方突破EMA20（多单反转信号）
+    if side == 'long' and slope_15m < 0 and current_price > ema20_15m and recent_ret > 0.005:
+        return True, "价格突破下跌趋势的EMA20，可能反转向上"
+    if side == 'short' and slope_15m > 0 and current_price < ema20_15m and recent_ret < -0.005:
+        return True, "价格跌破上涨趋势的EMA20，可能反转向下"
+    return False, ""
+
+def check_price_momentum_filter(symbol, side, current_price):
+    """
+    价格动量过滤：对于顺势信号，如果最近3根K线累计涨跌幅已经超过 MOMENTUM_LIMIT_PCT，
+    则拒绝开仓（避免追高/追低）。
+    """
+    if not ENABLE_PRICE_MOMENTUM_FILTER:
+        return True, ""
+    try:
+        df = fetch_klines_with_retry(symbol, BAR, 5)
+        if df is None or len(df) < 4:
+            return True, "数据不足"
+        closes = df['c'].astype(float)
+        # 计算最近3根K线的累计收益率
+        start_price = closes.iloc[-4]
+        end_price = closes.iloc[-1]
+        total_ret = (end_price - start_price) / start_price * 100
+        if side == 'long' and total_ret > MOMENTUM_LIMIT_PCT:
+            return False, f"最近3根K线已累计上涨{total_ret:.2f}% > {MOMENTUM_LIMIT_PCT}%，追高风险大"
+        if side == 'short' and total_ret < -MOMENTUM_LIMIT_PCT:
+            return False, f"最近3根K线已累计下跌{abs(total_ret):.2f}% > {MOMENTUM_LIMIT_PCT}%，追跌风险大"
+        return True, ""
+    except Exception as e:
+        log(f"动量过滤异常 {symbol}: {e}")
+        return True, ""
 
 def predict_and_score(instId):
     try:
@@ -982,7 +985,7 @@ def predict_and_score(instId):
     except Exception as e:
         return None, f"异常: {str(e)[:50]}"
 
-# ==================== 9. 预测循环（与之前相同，只改动少量细节） ====================
+# ==================== 8. 预测循环 ====================
 def run_prediction_cycle():
     now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     log(f"\n============================================================")
@@ -1157,7 +1160,7 @@ def run_prediction_cycle():
         json.dump({k: v[0] for k, v in output_dict.items()}, f, indent=2, ensure_ascii=False)
     return output_dict
 
-# ==================== 10. 交易模块（保留原有功能，同时融入新的安全检查） ====================
+# ==================== 9. 交易模块 ====================
 class OKXTrader:
     def __init__(self):
         self.exchange = self._init()
@@ -2091,7 +2094,7 @@ class OKXTrader:
     def clear_pending_signals(self):
         self.pending_signals = []
 
-# ==================== 11. 主程序 ====================
+# ==================== 10. 主程序 ====================
 def main():
     with open("/tmp/trading_bot.pid", "w") as f:
         f.write(str(os.getpid()))
@@ -2101,7 +2104,7 @@ def main():
     has_set_pending_this_cycle = False
 
     log("\n========== 全自动交易系统已启动 ==========")
-    push_telegram(f"🤖 交易机器人启动\nK线: {BAR} | 预测: {HORIZON}根 ({HORIZON*3}分钟) | 每{PREDICTION_INTERVAL/60:.1f}分钟一轮\n止盈: 动态止损+跟踪止损 | 最长持仓: 动态预测时间\n固定保证金: {MAX_SINGLE_TRADE_USDT} USDT/币\n流动性: 成交额≥{MIN_VOLUME_USDT/1_000_000:.0f}M, 市值≥{MIN_MARKET_CAP_USDT/1_000_000:.0f}M\n仓位模式: 逐仓 {LEVERAGE}x\n信号门槛: 置信度≥{MIN_DIRECTION_CONFIDENCE}, R²≥{MIN_R_SQUARED}\n技术指标: RSI周期{RSI_PERIOD} 多单<{RSI_LONG_THRESHOLD} 空单>{RSI_SHORT_THRESHOLD}; MACD({MACD_FAST},{MACD_SLOW},{MACD_SIGNAL})\n风控: 最多{MAX_CONCURRENT_POSITIONS}仓, 总保证金≤{MAX_TOTAL_MARGIN_RATIO*100}%权益\n开仓条件: 实体位置(顺势放宽)、有利移动、紧急动能、强势突破追单\n多空相对评分制 | 动态预期收益率: 顺势0.3% / 逆势0.8%\n持仓时间: 基于TimesFM预测路径动态估算，时间到强制平仓\n开仓前安全检查: 逆势信号检查1小时EMA20偏离、15分钟实体放大、成交量突增\n新增功能: 新闻监控、成交异动检测、趋势反转检测、价格动量过滤")
+    push_telegram(f"🤖 交易机器人启动\nK线: {BAR} | 预测: {HORIZON}根 ({HORIZON*3}分钟) | 每{PREDICTION_INTERVAL/60:.1f}分钟一轮\n止盈: 动态止损+跟踪止损 | 最长持仓: 动态预测时间\n固定保证金: {MAX_SINGLE_TRADE_USDT} USDT/币\n流动性: 成交额≥{MIN_VOLUME_USDT/1_000_000:.0f}M, 市值≥{MIN_MARKET_CAP_USDT/1_000_000:.0f}M\n仓位模式: 逐仓 {LEVERAGE}x\n信号门槛: 置信度≥{MIN_DIRECTION_CONFIDENCE}, R²≥{MIN_R_SQUARED}\n技术指标: RSI周期{RSI_PERIOD} 多单<{RSI_LONG_THRESHOLD} 空单>{RSI_SHORT_THRESHOLD}; MACD({MACD_FAST},{MACD_SLOW},{MACD_SIGNAL})\n风控: 最多{MAX_CONCURRENT_POSITIONS}仓, 总保证金≤{MAX_TOTAL_MARGIN_RATIO*100}%权益\n开仓条件: 实体位置(顺势放宽)、有利移动、紧急动能、强势突破追单\n多空相对评分制 | 动态预期收益率: 顺势0.3% / 逆势0.8%\n持仓时间: 基于TimesFM预测路径动态估算，时间到强制平仓\n开仓前安全检查: 逆势信号检查1小时EMA20偏离、15分钟实体放大、成交量突增\n新增功能: 免费新闻监控(Free Crypto News API)、成交异动检测、趋势反转检测、价格动量过滤")
 
     while True:
         try:
@@ -2156,7 +2159,7 @@ def main():
 
     return trader
 
-# ==================== 12. 入口 ====================
+# ==================== 11. 入口 ====================
 if __name__ == "__main__":
     trader_obj = None
     try:
