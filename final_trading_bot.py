@@ -984,14 +984,18 @@ def run_prediction_cycle():
         return {}
 
     df_results = pd.DataFrame(valid).sort_values("score", ascending=False)
-    df_results = df_results[df_results['score'] >= 95]
+    df_results = pd.DataFrame(valid).sort_values("score", ascending=False)
+    # 去掉分数过滤
     if df_results.empty:
-        log("❌ 无得分 ≥95 的高质量信号")
-        push_telegram("❌ 本轮无得分 ≥95 的高质量信号")
-        return {}
+       log("❌ 无任何信号")
+       push_telegram("❌ 本轮无任何信号")
+       return {}
 
     top = df_results.head(FINAL_PICK_N)
-
+    # 可选的警告信息
+    if top.iloc[0]['score'] < 60:
+       push_telegram(f"⚠️ 当前最佳信号得分仅 {top.iloc[0]['score']:.1f}，请关注风险")
+    
     msg = ["✅ 高质量交易信号："]
     for _, row in top.iterrows():
         symbol = row['symbol']
