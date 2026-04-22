@@ -16,6 +16,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import base64
 import hmac
 import hashlib
+import re
 
 # ==================== 1. 全局配置 & 日志初始化 ====================
 if sys.stdout.encoding != 'utf-8':
@@ -102,6 +103,19 @@ MAX_CANDLE_BODY_RATIO = 3.0           # 当前15分钟K线实体超过过去5根
 MAX_VOLUME_SPIKE_RATIO = 3.0          # 成交量突增超过3倍则拒绝
 SAFETY_TREND_BAR = "1h"               # 安全检查使用的K线周期
 
+# ==================== 新增功能参数 ====================
+ENABLE_NEWS_MONITOR = True             # 是否启用新闻监控
+NEWS_PAUSE_MINUTES = 5                 # 新闻出现后暂停交易多少分钟
+CRYPTOPANIC_API_KEY = ""               # 可选，免费版不需要key（但可能有限制）
+ENABLE_VOLUME_ANOMALY = True           # 是否启用成交异动检测
+VOLUME_ANOMALY_THRESHOLD = 5.0         # 成交量突增倍数（相对于过去5根K线平均）
+ENABLE_TREND_REVERSAL = True           # 是否启用趋势反转检测
+ENABLE_PRICE_MOMENTUM_FILTER = True    # 是否启用价格动量过滤
+MOMENTUM_LIMIT_PCT = 2.0               # 最近3根K线累计涨幅/跌幅超过此值则拒绝顺势开仓
+
+# 全局字典记录每个币种最后一次新闻影响的时间
+last_news_time = {}
+
 # ==================== 3. Telegram推送 ====================
 def push_telegram(content):
     if not TG_BOT_TOKEN: return False
@@ -148,7 +162,7 @@ def _build_timesfm_model():
 model = _build_timesfm_model()
 log("✅ 模型加载完成")
 
-# ==================== 5. OKX数据获取 ====================
+# ==================== 5. OKX数据获取（原有函数保持不变） ====================
 def get_all_swap_contracts():
     try:
         url = "https://www.okx.com/api/v5/public/instruments"
@@ -233,7 +247,7 @@ def calculate_volatility(prices):
     ret = np.diff(prices) / prices[:-1]
     return np.std(ret) * 1000
 
-# ==================== 6. 技术指标计算 ====================
+# ==================== 6. 技术指标计算（原有函数保持不变） ====================
 def compute_rsi(series, period=14):
     delta = series.diff()
     gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
@@ -436,7 +450,110 @@ def get_adaptive_trading_params(bar_frame, volatility_profile):
         })
     return params
 
-# ==================== 7. 预测评分 + 多空相对评分制 ====================
+# ==================== 7. 新增辅助功能函数 ====================
+def check_news_impact(symbol):
+    """
+    查询 CryptoPanic 新闻聚合，判断该币种是否有高影响力新闻。
+    返回 (is_impacted, news_title)
+    """
+    if not ENABLE_NEWS_MONITOR:
+        return False, ""
+    # 提取币种名称（去掉 -USDT-SWAP 后缀）
+    coin = symbol.split('-')[0]
+    try:
+        url = f"https://cryptopanic.com/api/v1/posts/?auth_token={CRYPTOPANIC_API_KEY}&currencies={coin}&filter=important"
+        resp = requests.get(url, timeout=5)
+        if resp.status_code == 200:
+            data = resp.json()
+            # 检查最近 NEWS_PAUSE_MINUTES 分钟内是否有重要新闻
+            now = datetime.now()
+            for post in data.get('results', []):
+                published = datetime.strptime(post['published_at'], "%Y-%m-%dT%H:%M:%SZ")
+                if (now - published).total_seconds() < NEWS_PAUSE_MINUTES * 60:
+                    if post.get('kind') in ['news', 'important']:
+                        return True, post.get('title', '')
+        return False, ""
+    except Exception as e:
+        log(f"新闻API调用失败 {symbol}: {e}")
+        return False, ""
+
+def check_volume_anomaly(symbol, current_price):
+    """
+    检测成交异动：最近一根K线成交量是否超过过去5根平均成交量的 N 倍
+    返回 (is_anomaly, ratio, description)
+    """
+    if not ENABLE_VOLUME_ANOMALY:
+        return False, 1.0, ""
+    try:
+        df = fetch_klines_with_retry(symbol, BAR, 10)
+        if df is None or len(df) < 6:
+            return False, 1.0, "数据不足"
+        volumes = df['v'].astype(float)
+        avg_vol = volumes.iloc[-6:-1].mean()  # 过去5根平均
+        current_vol = volumes.iloc[-1]
+        if avg_vol == 0:
+            return False, 1.0, "平均成交量为0"
+        ratio = current_vol / avg_vol
+        if ratio > VOLUME_ANOMALY_THRESHOLD:
+            # 同时检查价格变动是否剧烈（超过1%）
+            closes = df['c'].astype(float)
+            price_change = abs((closes.iloc[-1] - closes.iloc[-2]) / closes.iloc[-2] * 100)
+            if price_change > 1.0:
+                return True, ratio, f"成交量突增{ratio:.1f}倍，价格波动{price_change:.1f}%"
+        return False, ratio, ""
+    except Exception as e:
+        log(f"成交异动检测异常 {symbol}: {e}")
+        return False, 1.0, ""
+
+def check_trend_reversal(symbol, side, current_price, ema20_15m, slope_15m):
+    """
+    检测趋势反转可能性。如果当前价格突破关键均线且动量变化，返回 (is_reversal, reason)
+    主要用于拒绝逆势开仓或警告。
+    """
+    if not ENABLE_TREND_REVERSAL:
+        return False, ""
+    if ema20_15m is None or slope_15m is None:
+        return False, "无趋势数据"
+    # 获取最近3根15分钟K线，观察价格是否连续突破
+    df_15m = fetch_klines_with_retry(symbol, HIGHER_BAR, 5)
+    if df_15m is None or len(df_15m) < 4:
+        return False, "数据不足"
+    closes = df_15m['c'].astype(float)
+    # 计算最近2根K线的涨跌
+    recent_ret = (closes.iloc[-1] - closes.iloc[-2]) / closes.iloc[-2]
+    # 判断价格是否从下方突破EMA20（多单反转信号）
+    if side == 'long' and slope_15m < 0 and current_price > ema20_15m and recent_ret > 0.005:
+        return True, "价格突破下跌趋势的EMA20，可能反转向上"
+    if side == 'short' and slope_15m > 0 and current_price < ema20_15m and recent_ret < -0.005:
+        return True, "价格跌破上涨趋势的EMA20，可能反转向下"
+    return False, ""
+
+def check_price_momentum_filter(symbol, side, current_price):
+    """
+    价格动量过滤：对于顺势信号，如果最近3根K线累计涨跌幅已经超过 MOMENTUM_LIMIT_PCT，
+    则拒绝开仓（避免追高/追低）。
+    """
+    if not ENABLE_PRICE_MOMENTUM_FILTER:
+        return True, ""
+    try:
+        df = fetch_klines_with_retry(symbol, BAR, 5)
+        if df is None or len(df) < 4:
+            return True, "数据不足"
+        closes = df['c'].astype(float)
+        # 计算最近3根K线的累计收益率
+        start_price = closes.iloc[-4]
+        end_price = closes.iloc[-1]
+        total_ret = (end_price - start_price) / start_price * 100
+        if side == 'long' and total_ret > MOMENTUM_LIMIT_PCT:
+            return False, f"最近3根K线已累计上涨{total_ret:.2f}% > {MOMENTUM_LIMIT_PCT}%，追高风险大"
+        if side == 'short' and total_ret < -MOMENTUM_LIMIT_PCT:
+            return False, f"最近3根K线已累计下跌{abs(total_ret):.2f}% > {MOMENTUM_LIMIT_PCT}%，追跌风险大"
+        return True, ""
+    except Exception as e:
+        log(f"动量过滤异常 {symbol}: {e}")
+        return True, ""
+
+# ==================== 8. 预测评分 + 多空相对评分制（原有核心逻辑，加入新过滤器） ====================
 def get_ema20_3m(symbol):
     try:
         df = fetch_klines_with_retry(symbol, BAR, 30)
@@ -605,13 +722,6 @@ def validate_signal(signal_type, symbol, current_price, rsi, adx, atr_pct, forec
     return True, "信号有效"
 
 def estimate_hold_minutes(forecast_values, current_price, target_return_pct, side):
-    """
-    根据预测价格路径估算达到目标收益率所需的时间（分钟）
-    forecast_values: 未来HORIZON个点的预测价格（每个点间隔3分钟）
-    target_return_pct: 目标收益率（绝对值，例如0.6% -> 0.006）
-    side: 'long' 或 'short'
-    返回分钟数，如果预测窗口内未达到则返回 HORIZON*3 分钟
-    """
     if forecast_values is None or len(forecast_values) == 0:
         return HORIZON * 3
     price_seq = [current_price] + list(forecast_values[:HORIZON])
@@ -704,7 +814,7 @@ def predict_and_score(instId):
         best_ret = 0
         reason_detail = ""
 
-        # 一致性反转逻辑（增加收益检查）
+        # 一致性反转逻辑
         if consistency < 0.2:
             if short_score > 0.4 and abs(expected_return) >= 0.003:
                 best_side = 'short'
@@ -747,7 +857,7 @@ def predict_and_score(instId):
         weak_rally = check_weak_rally(instId, current_price, rsi_val)
         diff = long_score - short_score
 
-        # 情况1：多单置信度极低 + 大趋势向下 -> 强制空单（增加收益检查）
+        # 情况1：多单置信度极低 + 大趋势向下 -> 强制空单
         if long_conf < 0.3 and is_downtrend:
             if short_score > 0.6 and abs(expected_return) >= min_ret_short:
                 best_side = 'short'
@@ -756,7 +866,7 @@ def predict_and_score(instId):
                 best_ret = -abs(expected_return)
                 reason_detail = f"多单置信度极低({long_conf:.2f})且趋势向下，强制空单(降门槛至0.6)"
 
-        # 情况2：弱势反抽且空单评分明显优于多单（增加收益检查）
+        # 情况2：弱势反抽且空单评分明显优于多单
         elif weak_rally and (short_score - long_score) > 0.15:
             if abs(expected_return) >= TREND_FOLLOWING_RETURN:
                 best_side = 'short'
@@ -795,6 +905,23 @@ def predict_and_score(instId):
 
         if best_side is None:
             return None, f"多空均未通过动态评分 (多: {long_conf:.2f}/{long_score:.1f}, 空: {short_conf:.2f}/{short_score:.1f}, diff={diff:.2f})"
+
+        # ---------- 新增：新闻影响检查 ----------
+        news_impact, news_title = check_news_impact(instId)
+        if news_impact:
+            return None, f"新闻影响暂停: {news_title[:50]}"
+        # ---------- 新增：成交异动检查 ----------
+        anomaly, vol_ratio_anom, anom_reason = check_volume_anomaly(instId, current_price)
+        if anomaly:
+            return None, f"成交异动拒绝: {anom_reason}"
+        # ---------- 新增：趋势反转检测 ----------
+        reversal, reversal_reason = check_trend_reversal(instId, best_side, current_price, ema20_15m, slope_15m)
+        if reversal:
+            return None, f"趋势反转检测: {reversal_reason}"
+        # ---------- 新增：价格动量过滤 ----------
+        momentum_ok, momentum_reason = check_price_momentum_filter(instId, best_side, current_price)
+        if not momentum_ok:
+            return None, f"动量过滤: {momentum_reason}"
 
         valid, reject_reason = validate_signal(
             signal_type=best_side.upper(),
@@ -855,7 +982,7 @@ def predict_and_score(instId):
     except Exception as e:
         return None, f"异常: {str(e)[:50]}"
 
-# ==================== 8. 预测循环 ====================
+# ==================== 9. 预测循环（与之前相同，只改动少量细节） ====================
 def run_prediction_cycle():
     now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     log(f"\n============================================================")
@@ -935,7 +1062,6 @@ def run_prediction_cycle():
             long_score = 0.0
             short_score = 0.0
             try:
-                import re
                 match_long = re.search(r'多:\s*[\d.]+/([\d.]+)', reason)
                 match_short = re.search(r'空:\s*[\d.]+/([\d.]+)', reason)
                 if match_long:
@@ -1031,7 +1157,7 @@ def run_prediction_cycle():
         json.dump({k: v[0] for k, v in output_dict.items()}, f, indent=2, ensure_ascii=False)
     return output_dict
 
-# ==================== 9. 交易模块 ====================
+# ==================== 10. 交易模块（保留原有功能，同时融入新的安全检查） ====================
 class OKXTrader:
     def __init__(self):
         self.exchange = self._init()
@@ -1310,7 +1436,7 @@ class OKXTrader:
             err(f"计算合约张数失败 {symbol}: {e}")
             return None, None, None, False
 
-    def check_price_position_entity(self, symbol, side):
+    def check_price_position_entity(self, symbol, side, is_with_trend=False):
         try:
             candle = fetch_previous_candle(symbol)
             if candle is None:
@@ -1324,13 +1450,21 @@ class OKXTrader:
             ticker = self.exchange.fetch_ticker(symbol)
             current_price = ticker['last']
             if side == 'long':
-                max_allowed = body_bottom + body_len * PRICE_POSITION_RATIO
+                if is_with_trend:
+                    # 顺势多单：允许价格 ≤ 实体顶部
+                    max_allowed = body_top
+                else:
+                    max_allowed = body_bottom + body_len * PRICE_POSITION_RATIO
                 if current_price <= max_allowed:
                     return True, f"价格位置满足多单条件: 当前{current_price:.6f} ≤ {max_allowed:.6f}"
                 else:
                     return False, f"价格位置不满足多单条件: 当前{current_price:.6f} > {max_allowed:.6f}"
             else:
-                min_allowed = body_top - body_len * PRICE_POSITION_RATIO
+                if is_with_trend:
+                    # 顺势空单：允许价格 ≥ 实体底部
+                    min_allowed = body_bottom
+                else:
+                    min_allowed = body_top - body_len * PRICE_POSITION_RATIO
                 if current_price >= min_allowed:
                     return True, f"价格位置满足空单条件: 当前{current_price:.6f} ≥ {min_allowed:.6f}"
                 else:
@@ -1441,19 +1575,45 @@ class OKXTrader:
                 log(f"⏸️ {raw_symbol} 已有持仓，取消待开仓信号")
                 to_remove.append(idx)
                 continue
+
+            # 获取趋势判断
+            ema20_15m, slope_15m = get_15min_trend(raw_symbol)
+            is_uptrend = slope_15m is not None and slope_15m > 0.002
+            is_downtrend = slope_15m is not None and slope_15m < -0.002
+            is_with_trend = (side == 'long' and is_uptrend) or (side == 'short' and is_downtrend)
+
+            # 强势突破追单（顺势突破立即开仓）
+            df_last = fetch_klines_with_retry(raw_symbol, BAR, 2)
+            is_breakout = False
+            if df_last is not None and len(df_last) >= 2:
+                prev_candle = df_last.iloc[-2]
+                prev_high = prev_candle['h']
+                prev_low = prev_candle['l']
+                is_breakout = (side == 'long' and current_price > prev_high) or (side == 'short' and current_price < prev_low)
+
+            if is_breakout and is_with_trend:
+                log(f"🚀 顺势突破开仓 {raw_symbol} {side.upper()} 价格 {current_price}")
+                success = self.open_position(raw_symbol, side, margin, expected_return, hold_minutes, ignore_price_position=True, is_with_trend=True)
+                if success:
+                    to_remove.append(idx)
+                else:
+                    log(f"⚠️ 开仓失败 {raw_symbol} {side.upper()}，保留在待开仓队列中")
+                continue
+
+            # 原有有利移动和实体位置逻辑
             favorable, pct_change = self.check_favorable_move(signal_price, side, current_price)
             if favorable:
                 log(f"🚀 价格向有利方向移动 {pct_change:.2f}% ≥ {FAVORABLE_MOVE_PCT}%，立即开仓 {raw_symbol} {side.upper()}")
-                success = self.open_position(raw_symbol, side, margin, expected_return, hold_minutes, ignore_price_position=True)
+                success = self.open_position(raw_symbol, side, margin, expected_return, hold_minutes, ignore_price_position=True, is_with_trend=is_with_trend)
                 if success:
                     to_remove.append(idx)
                 else:
                     log(f"⚠️ 开仓失败 {raw_symbol} {side.upper()}，保留在待开仓队列中")
             else:
-                ok, msg = self.check_price_position_entity(raw_symbol, side)
+                ok, msg = self.check_price_position_entity(raw_symbol, side, is_with_trend=is_with_trend)
                 if ok:
                     log(f"🚀 待开仓信号价格满足实体位置条件: {raw_symbol} {side.upper()}")
-                    success = self.open_position(raw_symbol, side, margin, expected_return, hold_minutes, ignore_price_position=False)
+                    success = self.open_position(raw_symbol, side, margin, expected_return, hold_minutes, ignore_price_position=False, is_with_trend=is_with_trend)
                     if success:
                         to_remove.append(idx)
                     else:
@@ -1463,7 +1623,7 @@ class OKXTrader:
         for idx in sorted(to_remove, reverse=True):
             self.pending_signals.pop(idx)
 
-    def open_position(self, symbol, side, base_margin_usdt, expected_return, expected_hold_minutes, ignore_price_position=False):
+    def open_position(self, symbol, side, base_margin_usdt, expected_return, expected_hold_minutes, ignore_price_position=False, is_with_trend=False):
         current_positions = self.sync_positions()
         ccxt_symbol = self.exchange.market(symbol)['symbol']
         if ccxt_symbol in current_positions:
@@ -1485,7 +1645,7 @@ class OKXTrader:
 
         # 实体位置检查（如果不忽略）
         if not ignore_price_position:
-            ok, msg = self.check_price_position_entity(symbol, side)
+            ok, msg = self.check_price_position_entity(symbol, side, is_with_trend=is_with_trend)
             if not ok:
                 log(f"⏸️ 跳过开仓 {symbol} {side}: {msg}")
                 return False
@@ -1931,7 +2091,7 @@ class OKXTrader:
     def clear_pending_signals(self):
         self.pending_signals = []
 
-# ==================== 10. 主程序 ====================
+# ==================== 11. 主程序 ====================
 def main():
     with open("/tmp/trading_bot.pid", "w") as f:
         f.write(str(os.getpid()))
@@ -1941,7 +2101,7 @@ def main():
     has_set_pending_this_cycle = False
 
     log("\n========== 全自动交易系统已启动 ==========")
-    push_telegram(f"🤖 交易机器人启动\nK线: {BAR} | 预测: {HORIZON}根 ({HORIZON*3}分钟) | 每{PREDICTION_INTERVAL/60:.1f}分钟一轮\n止盈: 动态止损+跟踪止损 | 最长持仓: 动态预测时间\n固定保证金: {MAX_SINGLE_TRADE_USDT} USDT/币\n流动性: 成交额≥{MIN_VOLUME_USDT/1_000_000:.0f}M, 市值≥{MIN_MARKET_CAP_USDT/1_000_000:.0f}M\n仓位模式: 逐仓 {LEVERAGE}x\n信号门槛: 置信度≥{MIN_DIRECTION_CONFIDENCE}, R²≥{MIN_R_SQUARED}\n技术指标: RSI周期{RSI_PERIOD} 多单<{RSI_LONG_THRESHOLD} 空单>{RSI_SHORT_THRESHOLD}; MACD({MACD_FAST},{MACD_SLOW},{MACD_SIGNAL})\n风控: 最多{MAX_CONCURRENT_POSITIONS}仓, 总保证金≤{MAX_TOTAL_MARGIN_RATIO*100}%权益\n开仓条件: 实体位置 或 价格有利移动 或 紧急动能信号\n多空相对评分制 | 动态预期收益率: 顺势0.3% / 逆势0.8%\n持仓时间: 基于TimesFM预测路径动态估算，时间到强制平仓\n开仓前安全检查: 仅对逆势信号检查1小时EMA20偏离(>{MAX_DEVIATION_FROM_EMA_PCT}%)、15分钟实体放大、成交量突增")
+    push_telegram(f"🤖 交易机器人启动\nK线: {BAR} | 预测: {HORIZON}根 ({HORIZON*3}分钟) | 每{PREDICTION_INTERVAL/60:.1f}分钟一轮\n止盈: 动态止损+跟踪止损 | 最长持仓: 动态预测时间\n固定保证金: {MAX_SINGLE_TRADE_USDT} USDT/币\n流动性: 成交额≥{MIN_VOLUME_USDT/1_000_000:.0f}M, 市值≥{MIN_MARKET_CAP_USDT/1_000_000:.0f}M\n仓位模式: 逐仓 {LEVERAGE}x\n信号门槛: 置信度≥{MIN_DIRECTION_CONFIDENCE}, R²≥{MIN_R_SQUARED}\n技术指标: RSI周期{RSI_PERIOD} 多单<{RSI_LONG_THRESHOLD} 空单>{RSI_SHORT_THRESHOLD}; MACD({MACD_FAST},{MACD_SLOW},{MACD_SIGNAL})\n风控: 最多{MAX_CONCURRENT_POSITIONS}仓, 总保证金≤{MAX_TOTAL_MARGIN_RATIO*100}%权益\n开仓条件: 实体位置(顺势放宽)、有利移动、紧急动能、强势突破追单\n多空相对评分制 | 动态预期收益率: 顺势0.3% / 逆势0.8%\n持仓时间: 基于TimesFM预测路径动态估算，时间到强制平仓\n开仓前安全检查: 逆势信号检查1小时EMA20偏离、15分钟实体放大、成交量突增\n新增功能: 新闻监控、成交异动检测、趋势反转检测、价格动量过滤")
 
     while True:
         try:
@@ -1996,7 +2156,7 @@ def main():
 
     return trader
 
-# ==================== 11. 入口 ====================
+# ==================== 12. 入口 ====================
 if __name__ == "__main__":
     trader_obj = None
     try:
