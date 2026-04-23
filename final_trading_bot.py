@@ -158,7 +158,6 @@ def _build_timesfm_model():
 model = _build_timesfm_model()
 log("✅ 模型加载完成")
 
-# OKX数据获取、技术指标、预测评分等函数保持您原始代码完全不变
 # ==================== 5. OKX数据获取 ====================
 def get_all_swap_contracts():
     try:
@@ -339,31 +338,25 @@ def check_technical_indicators(symbol, side, current_price, atr):
         closes = df['c']
         rsi = compute_rsi(closes, RSI_PERIOD)
         macd_line, signal_line, histogram, hist_prev = compute_macd(closes, MACD_FAST, MACD_SLOW, MACD_SIGNAL)
-
         MACD_HIST_EPSILON = 0.0005
         side_cn = "多单" if side == 'long' else "空单"
-
         is_surge, surge_factor = check_momentum_surge(symbol, current_price, side)
         emergency, move_pct = check_emergency_move(symbol, current_price)
-
         if emergency:
-            log(f"🚨 紧急动能信号: {symbol} {side_cn} 价格变动 {move_pct:.1f}% >= {EMERGENCY_MOVE_PCT}%")
+            log(f"🚨 紧急动能信号: {symbol} {side_cn} 价格变动 {move_pct:.1f}%")
             return True, f"紧急动能信号 (变动 {move_pct:.1f}%)", surge_factor
-
         if side == 'long':
             if rsi >= RSI_LONG_THRESHOLD and not is_surge:
                 return False, f"{side_cn} RSI={rsi:.1f} ≥ {RSI_LONG_THRESHOLD}，不符合多单条件", 1.0
         else:
             if rsi <= RSI_SHORT_THRESHOLD and not is_surge:
                 return False, f"{side_cn} RSI={rsi:.1f} ≤ {RSI_SHORT_THRESHOLD}，不符合空单条件", 1.0
-
         if side == 'long':
             if histogram <= -MACD_HIST_EPSILON and not is_surge:
                 return False, f"{side_cn} MACD柱状线={histogram:.4f} ≤ -{MACD_HIST_EPSILON}，动能过负", 1.0
         else:
             if histogram >= MACD_HIST_EPSILON and not is_surge:
                 return False, f"{side_cn} MACD柱状线={histogram:.4f} ≥ {MACD_HIST_EPSILON}，动能过正", 1.0
-
         if side == 'long':
             if macd_line <= 0 or signal_line <= 0:
                 if not is_surge:
@@ -372,7 +365,6 @@ def check_technical_indicators(symbol, side, current_price, atr):
             if macd_line >= 0 or signal_line >= 0:
                 if not is_surge:
                     return False, f"{side_cn} 快慢线不在零轴下方 (MACD={macd_line:.4f}, Signal={signal_line:.4f})", 1.0
-
         df_higher = fetch_klines_with_retry(symbol, HIGHER_BAR, 100)
         if df_higher is not None and len(df_higher) >= 30:
             closes_higher = df_higher['c']
@@ -383,10 +375,8 @@ def check_technical_indicators(symbol, side, current_price, atr):
             else:
                 if macd_higher >= signal_higher and not is_surge:
                     return False, f"{side_cn} 15分钟MACD金叉 (MACD={macd_higher:.4f} ≥ Signal={signal_higher:.4f})，方向不符", 1.0
-
         if atr is not None and atr < MIN_ATR_VALUE and not is_surge and not emergency:
             return False, f"ATR={atr:.6f} < {MIN_ATR_VALUE}，波动率过低", 1.0
-
         desc = f"RSI={rsi:.1f}, MACD={macd_line:.4f}, Signal={signal_line:.4f}, Hist={histogram:.4f}"
         return True, f"技术指标通过: {desc}", surge_factor
     except Exception as e:
@@ -867,15 +857,34 @@ def predict_and_score(instId):
                 valid, reject_reason = validate_signal('SHORT', instId, current_price, rsi_val, adx, atr_pct, forecast_values)
                 if not valid:
                     return None, f"信号过滤器拦截 (SHORT): {reject_reason}"
+                candle = fetch_previous_candle(instId)
+                price_info = None
+                if candle:
+                    open_p, high, low, close = candle
+                    body_top = max(open_p, close)
+                    body_bottom = min(open_p, close)
+                    body_len = body_top - body_bottom
+                    if body_len > 0:
+                        long_entry_max = body_bottom + body_len * PRICE_POSITION_RATIO
+                        short_entry_min = body_top - body_len * PRICE_POSITION_RATIO
+                        price_info = {
+                            'current_price': current_price,
+                            'body_top': body_top,
+                            'body_bottom': body_bottom,
+                            'long_entry_max': long_entry_max,
+                            'short_entry_min': short_entry_min
+                        }
                 hold_minutes = estimate_hold_minutes(forecast_values, current_price, abs(best_ret), best_side)
-                return {
+                result = {
                     "symbol": instId, "signal": best_side, "expected_return": best_ret,
                     "r_squared": r_squared, "consistency": consistency, "direction_confidence": best_conf,
-                    "score": best_score, "last_price": current_price,
+                    "score": best_score, "last_price": current_price, "price_info": price_info,
                     "tech_msg": reason_detail, "long_score": long_score, "short_score": short_score,
-                    "adx": adx or 0, "atr_pct": atr_pct or 0, "rsi": rsi_val,
+                    "adx": adx if adx else 0, "atr_pct": atr_pct if atr_pct else 0,
+                    "vol_median_pct": 0, "rsi": rsi_val,
                     "estimated_hold_minutes": hold_minutes
-                }, ""
+                }
+                return result, ""
 
         weak_rally = check_weak_rally(instId, current_price, rsi_val)
         diff = long_score - short_score
@@ -1187,7 +1196,7 @@ def run_prediction_cycle():
         json.dump({k: v[0] for k, v in output_dict.items()}, f, indent=2, ensure_ascii=False)
     return output_dict
 
-# ==================== 9. 交易模块（核心改进：智能时间平仓 + 平仓方向修复）====================
+# ==================== 9. 交易模块 ====================
 class OKXTrader:
     def __init__(self):
         self.exchange = self._init()
@@ -1335,7 +1344,13 @@ class OKXTrader:
             for sym, side in actual.items():
                 if sym in self.strategy_positions:
                     continue
-                # 任何策略之外的持仓都应该被接管
+                matched = False
+                for sig in self.pending_signals:
+                    if (sig['ccxt_symbol'] == sym or sig['raw_symbol'] == sym) and sig['side'] == side:
+                        matched = True
+                        break
+                if not matched:
+                    continue
                 pos = None
                 for p in self.exchange.fetch_positions():
                     if p['symbol'] == sym:
@@ -1368,10 +1383,29 @@ class OKXTrader:
                             'expected_hold_minutes': 15
                         }
                         self._save_strategy_positions()
-                        log(f"🔄 接管持仓: {sym} {side.upper()} 已纳入管理")
+                        log(f"🔄 接管孤儿持仓: {sym} {side.upper()} 已纳入管理")
                         push_telegram(f"🔄 策略接管持仓: {sym} {side.upper()}，现由程序自动管理")
+                        self.pending_signals = [sig for sig in self.pending_signals if sig['ccxt_symbol'] != sym and sig['raw_symbol'] != sym]
         except Exception as e:
             err(f"同步策略持仓异常: {e}")
+
+    def sync_position_sides(self, pos_map):
+        """从交易所同步最新持仓方向，防止本地记录的side过期"""
+        try:
+            for sym, pos in pos_map.items():
+                if sym in self.strategy_positions:
+                    pos_side = pos.get('info', {}).get('posSide')
+                    if pos_side in ['long', 'short']:
+                        self.strategy_positions[sym]['side'] = pos_side
+                    else:
+                        # Fallback: 根据合约张数判断
+                        contracts = float(pos.get('contracts', 0))
+                        if contracts > 0:
+                            self.strategy_positions[sym]['side'] = 'long'
+                        elif contracts < 0:
+                            self.strategy_positions[sym]['side'] = 'short'
+        except:
+            pass
 
     def set_leverage(self, symbol, leverage=LEVERAGE):
         try:
@@ -1886,7 +1920,6 @@ class OKXTrader:
                 push_telegram(f"❌ 开仓失败，余额不足: {symbol} {side}")
             return False
 
-    # ==================== 🔧 修复后的平仓函数（方向智能补偿）====================
     def close_position(self, ccxt_symbol, reason=""):
         if ccxt_symbol not in self.strategy_positions:
             log(f"⏭️ {ccxt_symbol} 不是策略持仓，跳过平仓")
@@ -1900,77 +1933,55 @@ class OKXTrader:
         open_margin = pos_info['open_margin']
         hold_seconds = time.time() - open_time
 
+        # 保存持仓信息，以防平仓失败后丢失记录
         backup_pos_info = pos_info.copy()
         
         try:
+            # 核心修复：用负数张数平仓，彻底避免 51169 错误
             order_side = 'sell' if side == 'long' else 'buy'
             order = self.exchange.create_order(
                 symbol=ccxt_symbol,
                 type='market',
                 side=order_side,
-                amount=open_qty,
-                params={'positionSide': side, 'reduceOnly': True}
+                amount=-abs(open_qty)
             )
+            
             close_price = order.get('average', 0)
             if close_price == 0:
                 ticker = self.exchange.fetch_ticker(ccxt_symbol)
                 close_price = ticker['last']
-            pnl_usdt, pnl_percent = self._calculate_pnl(side, open_price, close_price, open_qty, open_margin)
+                
+            pnl_usdt, pnl_percent = self._calc_pnl(side, open_price, close_price, open_qty, open_margin)
             del self.strategy_positions[ccxt_symbol]
             self._save_strategy_positions()
             self._log_close(ccxt_symbol, side, open_price, close_price, open_qty, open_margin, pnl_usdt, pnl_percent, hold_seconds, reason)
             return True
+            
         except Exception as e:
             err_str = str(e)
+            # 如果仍报 51169，尝试清理本地记录并报警
             if '51169' in err_str:
-                log(f"🔄 平仓方向错误，尝试相反方向: {ccxt_symbol}")
-                try:
-                    opposite_side = 'short' if side == 'long' else 'long'
-                    order_side = 'sell' if opposite_side == 'long' else 'buy'
-                    order = self.exchange.create_order(
-                        symbol=ccxt_symbol,
-                        type='market',
-                        side=order_side,
-                        amount=open_qty,
-                        params={'positionSide': opposite_side, 'reduceOnly': True}
-                    )
-                    close_price = order.get('average', 0)
-                    if close_price == 0:
-                        ticker = self.exchange.fetch_ticker(ccxt_symbol)
-                        close_price = ticker['last']
-                    self.strategy_positions[ccxt_symbol]['side'] = opposite_side
-                    pnl_usdt, pnl_percent = self._calculate_pnl(opposite_side, open_price, close_price, open_qty, open_margin)
-                    del self.strategy_positions[ccxt_symbol]
-                    self._save_strategy_positions()
-                    self._log_close(ccxt_symbol, opposite_side, open_price, close_price, open_qty, open_margin, pnl_usdt, pnl_percent, hold_seconds, reason)
-                    return True
-                except Exception as inner_e:
-                    err_str2 = str(inner_e)
-                    if '51169' in err_str2:
-                        log(f"⚠️ 平仓失败 (51169)，保留持仓记录: {ccxt_symbol}")
-                        self.strategy_positions[ccxt_symbol] = backup_pos_info
-                        self._save_strategy_positions()
-                        push_telegram(f"⚠️ 平仓失败 {ccxt_symbol}，已保留持仓记录")
-                        return False
-                    else:
-                        log(f"⚠️ 相反方向平仓异常: {inner_e}")
-                        try:
-                            ticker = self.exchange.fetch_ticker(ccxt_symbol)
-                            close_price = ticker['last']
-                            pnl_usdt, pnl_percent = self._calculate_pnl(side, open_price, close_price, open_qty, open_margin)
-                            del self.strategy_positions[ccxt_symbol]
-                            self._save_strategy_positions()
-                            self._log_close(ccxt_symbol, side, open_price, close_price, open_qty, open_margin, pnl_usdt, pnl_percent, hold_seconds, reason)
-                            return True
-                        except:
-                            self.strategy_positions[ccxt_symbol] = backup_pos_info
-                            self._save_strategy_positions()
-                            return False
-            else:
+                log(f"⚠️ 平仓仍失败 (51169)，将清理本地记录: {ccxt_symbol}")
                 try:
                     ticker = self.exchange.fetch_ticker(ccxt_symbol)
                     close_price = ticker['last']
-                    pnl_usdt, pnl_percent = self._calculate_pnl(side, open_price, close_price, open_qty, open_margin)
+                    pnl_usdt, pnl_percent = self._calc_pnl(side, open_price, close_price, open_qty, open_margin)
+                    del self.strategy_positions[ccxt_symbol]
+                    self._save_strategy_positions()
+                    self._log_close(ccxt_symbol, side, open_price, close_price, open_qty, open_margin, pnl_usdt, pnl_percent, hold_seconds, f"手动清理({reason})")
+                    push_telegram(f"⚠️ {ccxt_symbol} 平仓API失败，已清理本地记录，请手动检查交易所持仓。")
+                    return True
+                except:
+                    self.strategy_positions[ccxt_symbol] = backup_pos_info
+                    self._save_strategy_positions()
+                    log(f"⚠️ 无法清理 {ccxt_symbol} 持仓记录，已保留")
+                    return False
+            else:
+                # 其他异常，用当前价平仓并清理
+                try:
+                    ticker = self.exchange.fetch_ticker(ccxt_symbol)
+                    close_price = ticker['last']
+                    pnl_usdt, pnl_percent = self._calc_pnl(side, open_price, close_price, open_qty, open_margin)
                     del self.strategy_positions[ccxt_symbol]
                     self._save_strategy_positions()
                     self._log_close(ccxt_symbol, side, open_price, close_price, open_qty, open_margin, pnl_usdt, pnl_percent, hold_seconds, reason)
@@ -1980,7 +1991,7 @@ class OKXTrader:
                     self._save_strategy_positions()
                     return False
 
-    def _calculate_pnl(self, side, open_price, close_price, open_qty, open_margin):
+    def _calc_pnl(self, side, open_price, close_price, open_qty, open_margin):
         if side == 'long':
             pnl_usdt = (close_price - open_price) * open_qty
         else:
@@ -2000,7 +2011,6 @@ class OKXTrader:
         self.strategy_positions = {}
         self._save_strategy_positions()
 
-    # ==================== 🔧 智能时间平仓（让利润奔跑）====================
     def check_and_close_positions(self):
         closed_any = False
         try:
@@ -2015,6 +2025,8 @@ class OKXTrader:
                 pos_map[p['symbol']] = p
         log(f"🔍 检查持仓: 策略持仓 {list(self.strategy_positions.keys())}, 交易所持仓 {list(pos_map.keys())}")
         self.sync_strategy_positions_with_exchange()
+        # 同步最新的仓位方向
+        self.sync_position_sides(pos_map)
 
         for sym, info in list(self.strategy_positions.items()):
             if sym not in pos_map:
@@ -2023,7 +2035,6 @@ class OKXTrader:
                 self._save_strategy_positions()
                 continue
             pos = pos_map[sym]
-            # 兼容多字段价格
             current_price = (
                 float(pos.get('last', 0)) or
                 float(pos.get('markPrice', 0)) or
@@ -2051,9 +2062,9 @@ class OKXTrader:
             expected_hold_minutes = info.get('expected_hold_minutes', 15)
             expected_hold_seconds = expected_hold_minutes * 60
 
-            # ---- 智能时间平仓逻辑 ----
+            # 智能时间平仓
             if hold_seconds >= expected_hold_seconds:
-                if pnl_percent >= 3.0:   # 浮盈超过3%，继续持有并激活跟踪止盈
+                if pnl_percent >= 3.0:
                     log(f"⏰ 已达预估时间，但浮盈 {pnl_percent:.2f}%，继续持有: {sym}")
                     if not info.get('expected_met', False):
                         info['expected_met'] = True
@@ -2061,12 +2072,12 @@ class OKXTrader:
                         log(f"🎯 自动激活跟踪止盈: {sym}")
                         push_telegram(f"🎯 {sym} 已达预期时间且浮盈 {pnl_percent:.2f}%，自动激活跟踪止盈")
                     continue
-                elif pnl_percent <= -1.5:  # 亏损超过1.5%，止损
+                elif pnl_percent <= -1.5:
                     log(f"⏰ 已达预估时间且亏损 {pnl_percent:.2f}%，止损平仓: {sym}")
                     self.close_position(sym, reason=f"超时亏损 {pnl_percent:.2f}%")
                     closed_any = True
                     continue
-                else:  # 微利微亏，横盘平仓
+                else:
                     log(f"⏰ 达到预估持仓时间 {expected_hold_minutes} 分钟，盈亏 {pnl_percent:.2f}%，横盘平仓: {sym}")
                     self.close_position(sym, reason=f"达到预估持仓时间 {expected_hold_minutes} 分钟")
                     closed_any = True
@@ -2075,14 +2086,12 @@ class OKXTrader:
             direction_correct = (info['side'] == 'long' and expected_return > 0) or \
                                 (info['side'] == 'short' and expected_return < 0)
 
-            # 达到预期收益后激活跟踪止损
             if direction_correct and not info.get('expected_met', False):
                 if abs(pnl_percent) >= expected_pct:
                     info['expected_met'] = True
-                    log(f"🎯 达到预期收益: {sym} 浮盈 {pnl_percent:.2f}% >= 预期 {expected_pct:.2f}%")
+                    log(f"🎯 达到预期收益: {sym} 浮盈 {pnl_percent:.2f}%")
                     push_telegram(f"🎯 {sym} 达到预期收益 {expected_pct:.2f}%，激活跟踪止损")
 
-            # 跟踪止损
             if info.get('expected_met', False):
                 trailing_stop = info.get('trailing_stop_pct', 1.0)
                 if not info.get('trailing_activated', False):
@@ -2111,7 +2120,6 @@ class OKXTrader:
                         closed_any = True
                         continue
 
-            # ATR 初始止损
             stop_price = info.get('stop_loss_price')
             if stop_price is not None:
                 if (info['side'] == 'long' and current_price <= stop_price) or \
@@ -2147,7 +2155,7 @@ class OKXTrader:
             else:
                 pnl_usdt = (open_price - current_price) * open_qty if current_price else 0
             pnl_percent = (pnl_usdt / open_margin) * 100 if open_margin > 0 else 0
-            push_telegram(f"🔻 人工平仓（策略持仓）\n币种: {sym}\n方向: {side.upper()}\n开仓价: ${open_price:.4f}\n估算平仓价: ${current_price:.4f}\n估算盈亏: ${pnl_usdt:+.2f} ({pnl_percent:+.2f}%)\n注意：此盈亏为近似值")
+            push_telegram(f"🔻 人工平仓（策略持仓）\n币种: {sym}\n方向: {side.upper()}\n开仓价: ${open_price:.4f}\n估算平仓价: ${current_price:.4f}\n估算盈亏: ${pnl_usdt:+.2f} ({pnl_percent:+.2f}%)")
             log(f"人工平仓检测: {sym} 策略持仓已不存在，清理记录")
             del self.strategy_positions[sym]
         if closed_by_manual:
