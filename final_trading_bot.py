@@ -40,15 +40,15 @@ TG_BOT_TOKEN = "8722422674:AAGrKmRurQ2G__j-Vxbh5451v0e9_u97CQY"
 TG_CHAT_ID = "5372217316"
 TG_PROXIES = None
 
-BAR = "5m"                     # 改为5分钟K线
+BAR = "5m"
 HIGHER_BAR = "15m"
 LIMIT = 900
-HORIZON = 3                    # 预测3步（每步5分钟，共15分钟）
+HORIZON = 3
 
 TOP_N = 50
 FINAL_PICK_N = 3
-TREND_FOLLOWING_RETURN = 0.003   # 顺势 0.3%
-COUNTER_TREND_RETURN = 0.008     # 逆势 0.8%
+TREND_FOLLOWING_RETURN = 0.003
+COUNTER_TREND_RETURN = 0.008
 
 MIN_R_SQUARED = 0.2
 MIN_DIRECTION_CONFIDENCE = 0.65
@@ -71,7 +71,7 @@ IS_SANDBOX = False
 
 PREDICTION_INTERVAL = 60
 MIN_BALANCE_USDT = 10.0
-MAX_SINGLE_TRADE_USDT = 30
+MAX_SINGLE_TRADE_USDT = 50
 MAX_MARGIN_MULTIPLIER = 2
 
 TAKE_PROFIT_PCT = 8.0
@@ -97,22 +97,19 @@ VOLUME_SPIKE_RATIO = 2.5
 MIN_ATR_VALUE = 0.0005
 EMERGENCY_MOVE_PCT = 1.5
 
-# 开仓前安全检查参数
 MAX_DEVIATION_FROM_EMA_PCT = 2.5
 MAX_CANDLE_BODY_RATIO = 3.0
 MAX_VOLUME_SPIKE_RATIO = 3.0
 SAFETY_TREND_BAR = "1h"
 
-# ==================== 新增功能参数 ====================
-ENABLE_NEWS_MONITOR = True             # 是否启用新闻监控（使用 Finnhub API）
-NEWS_PAUSE_MINUTES = 5                 # 新闻出现后暂停交易多少分钟
+ENABLE_NEWS_MONITOR = True
+NEWS_PAUSE_MINUTES = 5
 ENABLE_VOLUME_ANOMALY = True
 VOLUME_ANOMALY_THRESHOLD = 5.0
 ENABLE_TREND_REVERSAL = True
 ENABLE_PRICE_MOMENTUM_FILTER = True
 MOMENTUM_LIMIT_PCT = 1.5
 
-# Finnhub API 密钥
 FINNHUB_API_KEY = "d7krlm1r01qiqbcvgihgd7krlm1r01qiqbcvgii0"
 
 # ==================== 3. Telegram推送 ====================
@@ -280,7 +277,6 @@ def get_15min_trend(symbol):
         return None, None
 
 def get_1h_trend(symbol):
-    """返回 (ema20, slope, is_downtrend, is_uptrend)"""
     try:
         df = fetch_klines_with_retry(symbol, "1h", 50)
         if df is None or len(df) < 30:
@@ -658,7 +654,7 @@ def validate_signal(signal_type, symbol, current_price, rsi, adx, atr_pct, forec
 
 def estimate_hold_minutes(forecast_values, current_price, target_return_pct, side):
     if forecast_values is None or len(forecast_values) == 0:
-        return HORIZON * 5   # 5分钟 * 3步 = 15分钟
+        return HORIZON * 5
     price_seq = [current_price] + list(forecast_values[:HORIZON])
     bar_minutes = 5
     for i in range(1, len(price_seq)):
@@ -670,12 +666,7 @@ def estimate_hold_minutes(forecast_values, current_price, target_return_pct, sid
             return i * bar_minutes
     return HORIZON * bar_minutes
 
-# ==================== 新闻监控函数（使用 Finnhub）====================
 def check_news_impact(symbol):
-    """
-    使用 Finnhub Crypto News API 检测突发新闻
-    返回 (is_impacted, news_title)
-    """
     if not ENABLE_NEWS_MONITOR:
         return False, ""
     if not FINNHUB_API_KEY:
@@ -698,9 +689,8 @@ def check_news_impact(symbol):
         for article in data[:10]:
             headline = article.get('headline', '')
             summary = article.get('summary', '')
-            # 检查是否包含当前币种
             if coin in headline.upper() or coin in summary.upper():
-                published_time = article.get('datetime')  # UNIX timestamp
+                published_time = article.get('datetime')
                 if published_time:
                     published = datetime.fromtimestamp(published_time)
                     if (now - published).total_seconds() < NEWS_PAUSE_MINUTES * 60:
@@ -1508,7 +1498,6 @@ class OKXTrader:
             current_price = ticker['last']
             if side == 'long':
                 if is_with_trend:
-                    # 顺势多单：允许价格 ≤ 实体顶部
                     max_allowed = body_top
                 else:
                     max_allowed = body_bottom + body_len * PRICE_POSITION_RATIO
@@ -1518,7 +1507,6 @@ class OKXTrader:
                     return False, f"价格位置不满足多单条件: 当前{current_price:.6f} > {max_allowed:.6f}"
             else:
                 if is_with_trend:
-                    # 顺势空单：允许价格 ≥ 实体底部
                     min_allowed = body_bottom
                 else:
                     min_allowed = body_top - body_len * PRICE_POSITION_RATIO
@@ -1559,54 +1547,37 @@ class OKXTrader:
                 err(f"获取市场信息失败 {raw_symbol}: {e}")
         log(f"📋 设置待开仓信号: {len(self.pending_signals)} 个")
 
-    # ---------- 开仓前安全检查（仅对逆势信号）----------
     def check_pre_open_safety(self, symbol, side, current_price, is_uptrend, is_downtrend):
-        """
-        开仓前安全检查，避免在突发消息或极端行情中反向开仓。
-        使用1小时EMA20判断价格偏离，使用15分钟K线判断实体和成交量。
-        返回 (is_safe, reason)
-        """
-        # 判断是否为顺势信号
         is_with_trend = (side == 'long' and is_uptrend) or (side == 'short' and is_downtrend)
         if is_with_trend:
             return True, "顺势信号，跳过安全检查"
 
-        # 以下只针对逆势或震荡信号
-        # 1. 获取1小时K线数据，计算EMA20（用于价格偏离）
         df_1h = fetch_klines_with_retry(symbol, SAFETY_TREND_BAR, 50)
-        if df_1h is None or len(df_1h) < 30:
-            return True, "1小时K线数据不足，跳过检查"
-        
-        closes_1h = df_1h['c'].astype(float)
-        ema20_1h = closes_1h.ewm(span=20, adjust=False).mean().iloc[-1]
-        if ema20_1h != 0:
-            deviation_pct = abs((current_price - ema20_1h) / ema20_1h) * 100
-            if deviation_pct > MAX_DEVIATION_FROM_EMA_PCT:
-                return False, f"逆势开仓但价格偏离1小时EMA20达 {deviation_pct:.2f}% > {MAX_DEVIATION_FROM_EMA_PCT}%，可能处于极端位置"
+        if df_1h is not None and len(df_1h) >= 30:
+            closes_1h = df_1h['c'].astype(float)
+            ema20_1h = closes_1h.ewm(span=20, adjust=False).mean().iloc[-1]
+            if ema20_1h != 0:
+                deviation_pct = abs((current_price - ema20_1h) / ema20_1h) * 100
+                if deviation_pct > MAX_DEVIATION_FROM_EMA_PCT:
+                    return False, f"逆势开仓但价格偏离1小时EMA20达 {deviation_pct:.2f}% > {MAX_DEVIATION_FROM_EMA_PCT}%，可能处于极端位置"
 
-        # 2. 获取15分钟K线数据，检查实体大小和成交量
         df_15m = fetch_klines_with_retry(symbol, HIGHER_BAR, 20)
-        if df_15m is None or len(df_15m) < 20:
-            return True, "15分钟K线数据不足，跳过检查"
-        
-        # 检查最近一根15分钟K线实体是否过大
-        last_candle = df_15m.iloc[-1]
-        body = abs(last_candle['c'] - last_candle['o'])
-        prev_bodies = [abs(df_15m.iloc[-i-2]['c'] - df_15m.iloc[-i-2]['o']) for i in range(5)]
-        avg_body = np.mean(prev_bodies) if prev_bodies else body
-        if avg_body > 0:
-            body_ratio = body / avg_body
-            if body_ratio > MAX_CANDLE_BODY_RATIO:
-                return False, f"逆势开仓但15分钟K线实体是平均的 {body_ratio:.1f} 倍 > {MAX_CANDLE_BODY_RATIO}，可能为爆发行情"
+        if df_15m is not None and len(df_15m) >= 20:
+            last_candle = df_15m.iloc[-1]
+            body = abs(last_candle['c'] - last_candle['o'])
+            prev_bodies = [abs(df_15m.iloc[-i-2]['c'] - df_15m.iloc[-i-2]['o']) for i in range(5)]
+            avg_body = np.mean(prev_bodies) if prev_bodies else body
+            if avg_body > 0:
+                body_ratio = body / avg_body
+                if body_ratio > MAX_CANDLE_BODY_RATIO:
+                    return False, f"逆势开仓但15分钟K线实体是平均的 {body_ratio:.1f} 倍 > {MAX_CANDLE_BODY_RATIO}，可能为爆发行情"
 
-        # 检查成交量是否突增
-        volumes_15m = df_15m['v'].astype(float)
-        avg_vol = volumes_15m.iloc[-6:-1].mean()
-        current_vol = volumes_15m.iloc[-1]
-        if avg_vol > 0 and current_vol / avg_vol > MAX_VOLUME_SPIKE_RATIO:
-            return False, f"逆势开仓但成交量突增 {current_vol/avg_vol:.1f} 倍 > {MAX_VOLUME_SPIKE_RATIO}，可能为消息驱动"
+            volumes_15m = df_15m['v'].astype(float)
+            avg_vol = volumes_15m.iloc[-6:-1].mean()
+            current_vol = volumes_15m.iloc[-1]
+            if avg_vol > 0 and current_vol / avg_vol > MAX_VOLUME_SPIKE_RATIO:
+                return False, f"逆势开仓但成交量突增 {current_vol/avg_vol:.1f} 倍 > {MAX_VOLUME_SPIKE_RATIO}，可能为消息驱动"
 
-        # ---------- 新增：大周期趋势二次检查 ----------
         if side == 'long':
             _, _, is_1h_downtrend, _ = get_1h_trend(symbol)
             _, slope_15m = get_15min_trend(symbol)
@@ -1621,7 +1592,6 @@ class OKXTrader:
                 return False, "逆势空单被大周期上涨趋势否决"
 
         return True, "安全检查通过"
-    # ---------- 安全检查结束 ----------
 
     def check_and_open_pending(self):
         if not self.pending_signals:
@@ -1647,13 +1617,11 @@ class OKXTrader:
                 to_remove.append(idx)
                 continue
 
-            # 获取趋势判断
             ema20_15m, slope_15m = get_15min_trend(raw_symbol)
             is_uptrend = slope_15m is not None and slope_15m > 0.002
             is_downtrend = slope_15m is not None and slope_15m < -0.002
             is_with_trend = (side == 'long' and is_uptrend) or (side == 'short' and is_downtrend)
 
-            # 强势突破追单（顺势突破立即开仓）
             df_last = fetch_klines_with_retry(raw_symbol, BAR, 2)
             is_breakout = False
             if df_last is not None and len(df_last) >= 2:
@@ -1671,7 +1639,6 @@ class OKXTrader:
                     log(f"⚠️ 开仓失败 {raw_symbol} {side.upper()}，保留在待开仓队列中")
                 continue
 
-            # 原有有利移动和实体位置逻辑
             favorable, pct_change = self.check_favorable_move(signal_price, side, current_price)
             if favorable:
                 log(f"🚀 价格向有利方向移动 {pct_change:.2f}% ≥ {FAVORABLE_MOVE_PCT}%，立即开仓 {raw_symbol} {side.upper()}")
@@ -1701,7 +1668,6 @@ class OKXTrader:
             log(f"⏸️ {symbol} 已有持仓 {current_positions[ccxt_symbol]}，拒绝重复开仓")
             return False
 
-        # 获取最新价格和趋势（用于安全检查）
         try:
             ticker = self.exchange.fetch_ticker(symbol)
             current_price = ticker['last']
@@ -1714,7 +1680,6 @@ class OKXTrader:
             ignore_price_position = True
             log(f"🚨 检测到紧急价格变动 {move_pct:.1f}%，将忽略实体位置检查直接开仓")
 
-        # 实体位置检查（如果不忽略）
         if not ignore_price_position:
             ok, msg = self.check_price_position_entity(symbol, side, is_with_trend=is_with_trend)
             if not ok:
@@ -1723,7 +1688,6 @@ class OKXTrader:
         else:
             log(f"🚀 忽略实体位置检查，因有利移动或紧急变动触发开仓 {symbol} {side}")
 
-        # ---------- 开仓前安全检查（仅对逆势信号）----------
         ema20_15m, slope_15m = get_15min_trend(symbol)
         is_uptrend = slope_15m is not None and slope_15m > 0.002
         is_downtrend = slope_15m is not None and slope_15m < -0.002
@@ -1734,9 +1698,7 @@ class OKXTrader:
             return False
         else:
             log(f"✅ 开仓前安全检查通过: {reason}")
-        # ---------- 安全检查结束 ----------
 
-        # 波动率自适应参数
         df_volatility = fetch_klines_with_retry(symbol, BAR, 30)
         if df_volatility is not None and len(df_volatility) >= 20:
             vol_profile, atr_pct = detect_volatility_profile(df_volatility)
@@ -2014,6 +1976,7 @@ class OKXTrader:
         self.strategy_positions = {}
         self._save_strategy_positions()
 
+    # ==================== 🔧 修复后的持仓检查函数 ====================
     def check_and_close_positions(self):
         closed_any = False
         try:
@@ -2036,9 +1999,21 @@ class OKXTrader:
                 self._save_strategy_positions()
                 continue
             pos = pos_map[sym]
-            current_price = float(pos.get('last', 0))
+            # 尝试多种价格字段
+            current_price = (
+                float(pos.get('last', 0)) or
+                float(pos.get('markPrice', 0)) or
+                float(pos.get('info', {}).get('last', 0)) or
+                float(pos.get('info', {}).get('markPrice', 0)) or
+                0
+            )
             if current_price == 0:
-                continue
+                try:
+                    ticker = self.exchange.fetch_ticker(sym)
+                    current_price = ticker['last']
+                except:
+                    log(f"⚠️ 无法获取 {sym} 最新价格，跳过本次检查")
+                    continue
 
             pnl_percent = float(pos.get('percentage', 0))
             if abs(pnl_percent) < 1:
@@ -2050,14 +2025,13 @@ class OKXTrader:
             expected_hold_minutes = info.get('expected_hold_minutes', 15)
             expected_hold_seconds = expected_hold_minutes * 60
 
-            # 动态时间平仓：达到预估持仓时间后立即平仓，无论盈亏
+            # 动态时间平仓
             if hold_seconds >= expected_hold_seconds:
                 log(f"⏰ 达到预估持仓时间 {expected_hold_minutes} 分钟，强制平仓: {sym} 盈亏 {pnl_percent:.2f}%, 预期 {expected_pct:.2f}%")
                 self.close_position(sym, reason=f"达到预估持仓时间 {expected_hold_minutes} 分钟")
                 closed_any = True
                 continue
 
-            # 方向判断
             direction_correct = (info['side'] == 'long' and expected_return > 0) or (info['side'] == 'short' and expected_return < 0)
 
             # 达到预期收益后激活跟踪止损
@@ -2067,7 +2041,7 @@ class OKXTrader:
                     log(f"🎯 达到预期收益: {sym} 浮盈 {pnl_percent:.2f}% >= 预期 {expected_pct:.2f}%")
                     push_telegram(f"🎯 {sym} 达到预期收益 {expected_pct:.2f}%，激活跟踪止损")
 
-            # 跟踪止损（仅在达到预期收益后激活）
+            # 跟踪止损
             if info.get('expected_met', False):
                 trailing_stop = info.get('trailing_stop_pct', 1.0)
 
