@@ -76,7 +76,7 @@ MAX_MARGIN_MULTIPLIER = 2
 
 TAKE_PROFIT_PCT = 8.0
 STOP_LOSS_PCT = 1.0
-MAX_HOLD_SECONDS = 300  # 保留作为后备，但主要使用动态预测时间
+MAX_HOLD_SECONDS = 300
 
 MIN_VOLUME_USDT = 10_000_000
 MIN_MARKET_CAP_USDT = 20_000_000
@@ -97,25 +97,22 @@ VOLUME_SPIKE_RATIO = 2.5
 MIN_ATR_VALUE = 0.0005
 EMERGENCY_MOVE_PCT = 1.5
 
-# 开仓前安全检查参数（仅对逆势信号生效）
-MAX_DEVIATION_FROM_EMA_PCT = 2.5      # 价格偏离1小时EMA20超过2.5%则拒绝逆势开仓
-MAX_CANDLE_BODY_RATIO = 3.0           # 当前15分钟K线实体超过过去5根平均实体的3倍则拒绝
-MAX_VOLUME_SPIKE_RATIO = 3.0          # 成交量突增超过3倍则拒绝
-SAFETY_TREND_BAR = "1h"               # 安全检查使用的K线周期
+# 开仓前安全检查参数
+MAX_DEVIATION_FROM_EMA_PCT = 2.5
+MAX_CANDLE_BODY_RATIO = 3.0
+MAX_VOLUME_SPIKE_RATIO = 3.0
+SAFETY_TREND_BAR = "1h"
 
 # ==================== 新增功能参数 ====================
 ENABLE_NEWS_MONITOR = True             # 是否启用新闻监控（使用 FMP 新闻 API）
 NEWS_PAUSE_MINUTES = 5                 # 新闻出现后暂停交易多少分钟
-ENABLE_VOLUME_ANOMALY = True           # 是否启用成交异动检测
-VOLUME_ANOMALY_THRESHOLD = 5.0         # 成交量突增倍数（相对于过去5根K线平均）
-ENABLE_TREND_REVERSAL = True           # 是否启用趋势反转检测（增强版）
-ENABLE_PRICE_MOMENTUM_FILTER = True    # 是否启用价格动量过滤
-MOMENTUM_LIMIT_PCT = 1.5               # 最近3根K线累计涨幅/跌幅超过1.5%则拒绝顺势开仓
+ENABLE_VOLUME_ANOMALY = True
+VOLUME_ANOMALY_THRESHOLD = 5.0
+ENABLE_TREND_REVERSAL = True
+ENABLE_PRICE_MOMENTUM_FILTER = True
+MOMENTUM_LIMIT_PCT = 1.5
 
-# 全局字典记录每个币种最后一次新闻影响的时间
-last_news_time = {}
-
-# FMP API 密钥（请重置密钥以保证安全）
+# FMP API 密钥（请重置并改用环境变量）
 FMP_API_KEY = "PmZnEBk6HqpDEFVTjsjlSABaDo6VCrAA"
 
 # ==================== 3. Telegram推送 ====================
@@ -282,7 +279,6 @@ def get_15min_trend(symbol):
         err(f"获取15分钟趋势失败 {symbol}: {e}")
         return None, None
 
-# ==================== 新增：1小时趋势判断 ====================
 def get_1h_trend(symbol):
     """返回 (ema20, slope, is_downtrend, is_uptrend)"""
     try:
@@ -294,7 +290,6 @@ def get_1h_trend(symbol):
         prev_ema20 = ema20.iloc[-2]
         curr_ema20 = ema20.iloc[-1]
         slope = (curr_ema20 - prev_ema20) / prev_ema20 if prev_ema20 != 0 else 0
-        # 连续多根K线收盘价低于EMA20视为强下跌趋势
         recent_closes = closes.iloc[-6:].values
         below_ema_count = sum(recent_closes < ema20.iloc[-6:].values)
         is_downtrend = (slope < -0.002) or (below_ema_count >= 4)
@@ -509,12 +504,11 @@ def check_weak_rally(symbol, current_price, rsi):
 def compute_signal_score(symbol, side, current_price, expected_return, r_squared, consistency, vol_ratio, ema20_15m, slope_15m, is_1h_downtrend=False, is_1h_uptrend=False, is_15m_downtrend=False, is_15m_uptrend=False):
     base_conf = 0.7 * consistency + 0.3 * max(0.0, min(1.0, r_squared))
     trend_factor = 1.0
-    # 强化趋势因子：大周期趋势直接否决
     if side == 'long':
         if is_1h_downtrend:
-            trend_factor = 0.0   # 1小时下跌趋势，多单得分归零
+            trend_factor = 0.0
         elif is_15m_downtrend:
-            trend_factor = 0.3   # 15分钟下跌大幅降权
+            trend_factor = 0.3
     else:
         if is_1h_uptrend:
             trend_factor = 0.0
@@ -657,10 +651,10 @@ def estimate_hold_minutes(forecast_values, current_price, target_return_pct, sid
             return i * bar_minutes
     return HORIZON * bar_minutes
 
-# ==================== 新增辅助功能函数 ====================
+# ==================== 新闻监控函数（已修正为 FMP stable 端点）====================
 def check_news_impact(symbol):
     """
-    使用 Financial Modeling Prep 的加密货币新闻 API
+    使用 Financial Modeling Prep 的 Crypto News API (stable 版本)
     返回 (is_impacted, news_title)
     """
     if not ENABLE_NEWS_MONITOR:
@@ -671,28 +665,30 @@ def check_news_impact(symbol):
     coin = symbol.split('-')[0].upper()
     
     try:
-        url = "https://financialmodelingprep.com/api/v4/crypto_news"
+        # 根据 FMP 官方文档，使用 /stable/news/crypto-latest 端点，并通过 symbols 参数过滤
+        url = "https://financialmodelingprep.com/stable/news/crypto-latest"
         params = {
-            "symbol": coin,
+            "symbols": coin,
             "limit": 5,
             "apikey": FMP_API_KEY
         }
         resp = requests.get(url, params=params, timeout=10)
         if resp.status_code != 200:
-            log(f"FMP API 响应异常: {resp.status_code}")
+            log(f"FMP API 响应异常: {resp.status_code} - {resp.text[:100]}")
             return False, ""
             
         data = resp.json()
         now = datetime.now()
         
         for article in data:
-            published_str = article.get('publishedDate')
+            # 兼容 publishedDate 或 date 字段
+            published_str = article.get('publishedDate') or article.get('date')
             title = article.get('title', '')
             
             if published_str:
                 try:
-                    published = datetime.strptime(published_str, "%Y-%m-%d %H:%M:%S")
-                    if (now - published).total_seconds() < NEWS_PAUSE_MINUTES * 60:
+                    published = datetime.fromisoformat(published_str.replace('Z', '+00:00'))
+                    if (now - published.replace(tzinfo=None)).total_seconds() < NEWS_PAUSE_MINUTES * 60:
                         log(f"📰 检测到相关新闻: {title[:50]}...")
                         return True, title
                 except Exception as parse_err:
@@ -705,10 +701,6 @@ def check_news_impact(symbol):
         return False, ""
 
 def check_volume_anomaly(symbol, current_price):
-    """
-    检测成交异动：最近一根K线成交量是否超过过去5根平均成交量的 N 倍
-    返回 (is_anomaly, ratio, description)
-    """
     if not ENABLE_VOLUME_ANOMALY:
         return False, 1.0, ""
     try:
@@ -716,13 +708,12 @@ def check_volume_anomaly(symbol, current_price):
         if df is None or len(df) < 6:
             return False, 1.0, "数据不足"
         volumes = df['v'].astype(float)
-        avg_vol = volumes.iloc[-6:-1].mean()  # 过去5根平均
+        avg_vol = volumes.iloc[-6:-1].mean()
         current_vol = volumes.iloc[-1]
         if avg_vol == 0:
             return False, 1.0, "平均成交量为0"
         ratio = current_vol / avg_vol
         if ratio > VOLUME_ANOMALY_THRESHOLD:
-            # 同时检查价格变动是否剧烈（超过1%）
             closes = df['c'].astype(float)
             price_change = abs((closes.iloc[-1] - closes.iloc[-2]) / closes.iloc[-2] * 100)
             if price_change > 1.0:
@@ -733,79 +724,37 @@ def check_volume_anomaly(symbol, current_price):
         return False, 1.0, ""
 
 def check_trend_reversal(symbol, side, current_price, ema20_15m, slope_15m):
-    """
-    增强版趋势反转检测。
-    对于多单：检测顶部反转形态（价格接近近期高点、出现阴线破位）
-    对于空单：检测底部反转形态（价格接近近期低点、出现阳线突破）
-    同时结合15分钟趋势转向。
-    返回 (is_reversal, reason)
-    """
     if not ENABLE_TREND_REVERSAL:
         return False, ""
-    
-    # 获取最近10根15分钟K线（用于检测顶部/底部形态）
     df_15m = fetch_klines_with_retry(symbol, HIGHER_BAR, 10)
     if df_15m is None or len(df_15m) < 6:
         return False, "数据不足"
-    
     closes = df_15m['c'].astype(float)
     highs = df_15m['h'].astype(float)
     lows = df_15m['l'].astype(float)
     opens = df_15m['o'].astype(float)
-    
-    # 最近5根K线的最高价和最低价（不包含当前未完成的K线，用前5根）
     recent_high = highs.iloc[-6:-1].max()
     recent_low = lows.iloc[-6:-1].min()
-    
-    # 最近一根K线是否收阴/收阳
-    last_candle_bearish = closes.iloc[-1] < opens.iloc[-1]  # 阴线
-    last_candle_bullish = closes.iloc[-1] > opens.iloc[-1]  # 阳线
-    
-    # 当前价格是否跌破上一根K线的最低价（破位）
+    last_candle_bearish = closes.iloc[-1] < opens.iloc[-1]
+    last_candle_bullish = closes.iloc[-1] > opens.iloc[-1]
     price_below_prev_low = current_price < lows.iloc[-2]
-    # 当前价格是否突破上一根K线的最高价（突破）
     price_above_prev_high = current_price > highs.iloc[-2]
-    
-    # 价格从近期高点的回落幅度（百分比）
-    if recent_high > 0:
-        drop_from_high = (recent_high - current_price) / recent_high * 100
-    else:
-        drop_from_high = 0
-    # 价格从近期低点的反弹幅度
-    if recent_low > 0:
-        rise_from_low = (current_price - recent_low) / recent_low * 100
-    else:
-        rise_from_low = 0
-    
-    # 多单反转检测（顶部形态）
+    drop_from_high = (recent_high - current_price) / recent_high * 100 if recent_high > 0 else 0
+    rise_from_low = (current_price - recent_low) / recent_low * 100 if recent_low > 0 else 0
+
     if side == 'long':
-        # 条件1：价格从近期高点回落超过 1.5%（可调）
-        # 条件2：最近一根K线收阴
-        # 条件3：价格跌破上一根K线低点
         if drop_from_high > 1.5 and last_candle_bearish and price_below_prev_low:
             return True, f"检测到顶部反转形态：价格从高点{recent_high:.4f}回落{drop_from_high:.1f}%，出现阴线破位"
-        # 额外：如果15分钟趋势已经转为向下，且价格在EMA20下方
         if slope_15m is not None and slope_15m < -0.001 and ema20_15m is not None and current_price < ema20_15m:
             return True, f"15分钟趋势已转为向下，价格在EMA20下方，拒绝做多"
-    
-    # 空单反转检测（底部形态）
     if side == 'short':
-        # 条件1：价格从近期低点反弹超过 1.5%
-        # 条件2：最近一根K线收阳
-        # 条件3：价格突破上一根K线高点
         if rise_from_low > 1.5 and last_candle_bullish and price_above_prev_high:
             return True, f"检测到底部反转形态：价格从低点{recent_low:.4f}反弹{rise_from_low:.1f}%，出现阳线突破"
-        # 额外：如果15分钟趋势已经转为向上，且价格在EMA20上方
         if slope_15m is not None and slope_15m > 0.001 and ema20_15m is not None and current_price > ema20_15m:
             return True, f"15分钟趋势已转为向上，价格在EMA20上方，拒绝做空"
-    
     return False, ""
 
 def check_price_momentum_filter(symbol, side, current_price):
-    """
-    价格动量过滤：对于顺势信号，如果最近3根K线累计涨跌幅已经超过 MOMENTUM_LIMIT_PCT，
-    则拒绝开仓（避免追高/追低）。
-    """
     if not ENABLE_PRICE_MOMENTUM_FILTER:
         return True, ""
     try:
@@ -813,7 +762,6 @@ def check_price_momentum_filter(symbol, side, current_price):
         if df is None or len(df) < 4:
             return True, "数据不足"
         closes = df['c'].astype(float)
-        # 计算最近3根K线的累计收益率
         start_price = closes.iloc[-4]
         end_price = closes.iloc[-1]
         total_ret = (end_price - start_price) / start_price * 100
@@ -875,7 +823,6 @@ def predict_and_score(instId):
         consistency = np.sum(np.sign(diffs) == direction) / len(diffs)
 
         ema20_15m, slope_15m = get_15min_trend(instId)
-        # 新增：获取1小时趋势
         ema20_1h, slope_1h, is_1h_downtrend, is_1h_uptrend = get_1h_trend(instId)
         is_15m_downtrend = slope_15m is not None and slope_15m < -0.002
         is_15m_uptrend = slope_15m is not None and slope_15m > 0.002
@@ -907,7 +854,6 @@ def predict_and_score(instId):
         best_ret = 0
         reason_detail = ""
 
-        # 一致性反转逻辑
         if consistency < 0.2:
             if short_score > 0.4 and abs(expected_return) >= 0.003:
                 best_side = 'short'
@@ -950,7 +896,6 @@ def predict_and_score(instId):
         weak_rally = check_weak_rally(instId, current_price, rsi_val)
         diff = long_score - short_score
 
-        # 情况1：多单置信度极低 + 大趋势向下 -> 强制空单
         if long_conf < 0.3 and is_15m_downtrend:
             if short_score > 0.6 and abs(expected_return) >= min_ret_short:
                 best_side = 'short'
@@ -958,8 +903,6 @@ def predict_and_score(instId):
                 best_conf = short_conf
                 best_ret = -abs(expected_return)
                 reason_detail = f"多单置信度极低({long_conf:.2f})且趋势向下，强制空单(降门槛至0.6)"
-
-        # 情况2：弱势反抽且空单评分明显优于多单
         elif weak_rally and (short_score - long_score) > 0.15:
             if abs(expected_return) >= TREND_FOLLOWING_RETURN:
                 best_side = 'short'
@@ -967,8 +910,6 @@ def predict_and_score(instId):
                 best_conf = short_conf
                 best_ret = -abs(expected_return)
                 reason_detail = f"弱势反抽触发顺势补票空单 (短分{short_score:.1f} > 多分{long_score:.1f}+0.15)"
-
-        # 情况3：常规多空相对比较
         else:
             if diff > 0.2 and long_conf >= MIN_DIRECTION_CONFIDENCE and abs(expected_return) >= min_ret_long:
                 best_side = 'long'
@@ -999,7 +940,7 @@ def predict_and_score(instId):
         if best_side is None:
             return None, f"多空均未通过动态评分 (多: {long_conf:.2f}/{long_score:.1f}, 空: {short_conf:.2f}/{short_score:.1f}, diff={diff:.2f})"
 
-        # ---------- 趋势强制否决规则 (核心新增) ----------
+        # 趋势强制否决规则
         if best_side == 'long':
             if is_1h_downtrend:
                 return None, f"1小时处于下跌趋势，禁止开多"
@@ -1011,27 +952,19 @@ def predict_and_score(instId):
             if is_15m_uptrend and not is_15m_downtrend:
                 return None, f"15分钟处于上涨趋势，禁止开空"
 
-        # 逆势信号额外降权（虽然可能已被否决，但仍做降权处理）
-        if best_side == 'long' and (is_15m_downtrend or is_1h_downtrend):
-            best_score = best_score * 0.3
-            log(f"⚠️ {instId} 多单为逆势信号，评分降至 {best_score:.2f}")
-        if best_side == 'short' and (is_15m_uptrend or is_1h_uptrend):
-            best_score = best_score * 0.3
-            log(f"⚠️ {instId} 空单为逆势信号，评分降至 {best_score:.2f}")
-
-        # ---------- 新增：新闻影响检查 ----------
+        # 新闻检查
         news_impact, news_title = check_news_impact(instId)
         if news_impact:
             return None, f"新闻影响暂停: {news_title[:50]}"
-        # ---------- 新增：成交异动检查 ----------
+
         anomaly, vol_ratio_anom, anom_reason = check_volume_anomaly(instId, current_price)
         if anomaly:
             return None, f"成交异动拒绝: {anom_reason}"
-        # ---------- 新增：趋势反转检测（增强版）----------
+
         reversal, reversal_reason = check_trend_reversal(instId, best_side, current_price, ema20_15m, slope_15m)
         if reversal:
             return None, f"趋势反转检测: {reversal_reason}"
-        # ---------- 新增：价格动量过滤 ----------
+
         momentum_ok, momentum_reason = check_price_momentum_filter(instId, best_side, current_price)
         if not momentum_ok:
             return None, f"动量过滤: {momentum_reason}"
@@ -2228,7 +2161,7 @@ def main():
     has_set_pending_this_cycle = False
 
     log("\n========== 全自动交易系统已启动 ==========")
-    push_telegram(f"🤖 交易机器人启动\nK线: {BAR} | 预测: {HORIZON}根 ({HORIZON*3}分钟) | 每{PREDICTION_INTERVAL/60:.1f}分钟一轮\n止盈: 动态止损+跟踪止损 | 最长持仓: 动态预测时间\n固定保证金: {MAX_SINGLE_TRADE_USDT} USDT/币\n流动性: 成交额≥{MIN_VOLUME_USDT/1_000_000:.0f}M, 市值≥{MIN_MARKET_CAP_USDT/1_000_000:.0f}M\n仓位模式: 逐仓 {LEVERAGE}x\n信号门槛: 置信度≥{MIN_DIRECTION_CONFIDENCE}, R²≥{MIN_R_SQUARED}\n技术指标: RSI周期{RSI_PERIOD} 多单<{RSI_LONG_THRESHOLD} 空单>{RSI_SHORT_THRESHOLD}; MACD({MACD_FAST},{MACD_SLOW},{MACD_SIGNAL})\n风控: 最多{MAX_CONCURRENT_POSITIONS}仓, 总保证金≤{MAX_TOTAL_MARGIN_RATIO*100}%权益\n开仓条件: 实体位置(顺势放宽)、有利移动、紧急动能、强势突破追单\n多空相对评分制 | 动态预期收益率: 顺势0.3% / 逆势0.8%\n持仓时间: 基于TimesFM预测路径动态估算，时间到强制平仓\n开仓前安全检查: 逆势信号检查1小时EMA20偏离、15分钟实体放大、成交量突增\n新增功能: FMP新闻监控、成交异动检测、增强版趋势反转检测(顶部/底部形态)、价格动量过滤(1.5%)\n大周期趋势过滤: 1小时/15分钟下跌趋势禁止开多，上涨趋势禁止开空")
+    push_telegram(f"🤖 交易机器人启动\nK线: {BAR} | 预测: {HORIZON}根 ({HORIZON*3}分钟) | 每{PREDICTION_INTERVAL/60:.1f}分钟一轮\n止盈: 动态止损+跟踪止损 | 最长持仓: 动态预测时间\n固定保证金: {MAX_SINGLE_TRADE_USDT} USDT/币\n流动性: 成交额≥{MIN_VOLUME_USDT/1_000_000:.0f}M, 市值≥{MIN_MARKET_CAP_USDT/1_000_000:.0f}M\n仓位模式: 逐仓 {LEVERAGE}x\n信号门槛: 置信度≥{MIN_DIRECTION_CONFIDENCE}, R²≥{MIN_R_SQUARED}\n技术指标: RSI周期{RSI_PERIOD} 多单<{RSI_LONG_THRESHOLD} 空单>{RSI_SHORT_THRESHOLD}; MACD({MACD_FAST},{MACD_SLOW},{MACD_SIGNAL})\n风控: 最多{MAX_CONCURRENT_POSITIONS}仓, 总保证金≤{MAX_TOTAL_MARGIN_RATIO*100}%权益\n开仓条件: 实体位置(顺势放宽)、有利移动、紧急动能、强势突破追单\n多空相对评分制 | 动态预期收益率: 顺势0.3% / 逆势0.8%\n持仓时间: 基于TimesFM预测路径动态估算，时间到强制平仓\n开仓前安全检查: 逆势信号检查1小时EMA20偏离、15分钟实体放大、成交量突增\n新闻监控: FMP Crypto News API (stable)\n大周期趋势过滤: 1小时/15分钟下跌趋势禁止开多，上涨趋势禁止开空")
 
     while True:
         try:
@@ -2255,7 +2188,6 @@ def main():
                         if available_balance < open_amount + 5:
                             push_telegram(f"⚠️ 可用余额不足 {open_amount} USDT（可用: {available_balance:.2f}），无法开仓")
                         else:
-                            # 过滤掉已有持仓的币种，避免重复信号开仓
                             existing_symbols = set(trader.strategy_positions.keys())
                             filtered_signals = {sym: (sig, exp_ret, hold_min) for sym, (sig, exp_ret, hold_min) in signals_dict.items() 
                                                 if sym not in existing_symbols}
