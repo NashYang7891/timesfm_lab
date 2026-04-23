@@ -40,10 +40,10 @@ TG_BOT_TOKEN = "8722422674:AAGrKmRurQ2G__j-Vxbh5451v0e9_u97CQY"
 TG_CHAT_ID = "5372217316"
 TG_PROXIES = None
 
-BAR = "3m"
+BAR = "5m"                     # 改为5分钟K线
 HIGHER_BAR = "15m"
 LIMIT = 900
-HORIZON = 4
+HORIZON = 3                    # 预测3步（每步5分钟，共15分钟）
 
 TOP_N = 50
 FINAL_PICK_N = 3
@@ -104,7 +104,7 @@ MAX_VOLUME_SPIKE_RATIO = 3.0
 SAFETY_TREND_BAR = "1h"
 
 # ==================== 新增功能参数 ====================
-ENABLE_NEWS_MONITOR = True             # 是否启用新闻监控（使用 FMP 新闻 API）
+ENABLE_NEWS_MONITOR = True             # 是否启用新闻监控（使用 Finnhub API）
 NEWS_PAUSE_MINUTES = 5                 # 新闻出现后暂停交易多少分钟
 ENABLE_VOLUME_ANOMALY = True
 VOLUME_ANOMALY_THRESHOLD = 5.0
@@ -112,8 +112,8 @@ ENABLE_TREND_REVERSAL = True
 ENABLE_PRICE_MOMENTUM_FILTER = True
 MOMENTUM_LIMIT_PCT = 1.5
 
-# FMP API 密钥（请重置并改用环境变量）
-FMP_API_KEY = "PmZnEBk6HqpDEFVTjsjlSABaDo6VCrAA"
+# Finnhub API 密钥
+FINNHUB_API_KEY = "d7krlm1r01qiqbcvgihgd7krlm1r01qiqbcvgii0"
 
 # ==================== 3. Telegram推送 ====================
 def push_telegram(content):
@@ -423,7 +423,26 @@ def get_adaptive_trading_params(bar_frame, volatility_profile):
         "stop_loss_pct": 1.5,
         "trailing_stop_pct": 1.0
     }
-    if bar_frame == "3m":
+    if bar_frame == "5m":
+        if volatility_profile == "EXTREME":
+            params.update({
+                "atr_multiplier": 3.5,
+                "stop_loss_pct": 4.0,
+                "trailing_stop_pct": 0.5
+            })
+        elif volatility_profile == "HIGH":
+            params.update({
+                "atr_multiplier": 2.5,
+                "stop_loss_pct": 2.5,
+                "trailing_stop_pct": 0.8
+            })
+        else:
+            params.update({
+                "atr_multiplier": 2.0,
+                "stop_loss_pct": 1.5,
+                "trailing_stop_pct": 1.0
+            })
+    elif bar_frame == "3m":
         if volatility_profile == "EXTREME":
             params.update({
                 "atr_multiplier": 3.5,
@@ -470,7 +489,7 @@ def get_adaptive_trading_params(bar_frame, volatility_profile):
     return params
 
 # ==================== 7. 预测评分 + 多空相对评分制 ====================
-def get_ema20_3m(symbol):
+def get_ema20_5m(symbol):
     try:
         df = fetch_klines_with_retry(symbol, BAR, 30)
         if df is None or len(df) < 25:
@@ -483,7 +502,7 @@ def get_ema20_3m(symbol):
 
 def check_weak_rally(symbol, current_price, rsi):
     try:
-        ema20 = get_ema20_3m(symbol)
+        ema20 = get_ema20_5m(symbol)
         if ema20 is None:
             return False
         if abs(current_price - ema20) / ema20 > 0.001:
@@ -604,8 +623,8 @@ def validate_signal(signal_type, symbol, current_price, rsi, adx, atr_pct, forec
             return False, f"价格突破布林带上轨 {bb_upper:.6f}，过高"
         if adx is not None and adx > 60:
             return False, f"ADX={adx:.1f} 趋势极端，可能衰竭"
-        if forecast_values is not None and len(forecast_values) >= 5:
-            forecast_high_max = max(forecast_values[:5])
+        if forecast_values is not None and len(forecast_values) >= 3:
+            forecast_high_max = max(forecast_values[:3])
             if forecast_high_max < current_price:
                 return False, f"TimesFM预测未来最高价 {forecast_high_max:.6f} 低于当前价，上涨乏力"
 
@@ -616,8 +635,8 @@ def validate_signal(signal_type, symbol, current_price, rsi, adx, atr_pct, forec
             return False, f"价格跌破布林带下轨 {bb_lower:.6f}，过低"
         if adx is not None and adx > 60:
             return False, f"ADX={adx:.1f} 趋势极端，可能衰竭"
-        if forecast_values is not None and len(forecast_values) >= 5:
-            forecast_low_min = min(forecast_values[:5])
+        if forecast_values is not None and len(forecast_values) >= 3:
+            forecast_low_min = min(forecast_values[:3])
             if forecast_low_min > current_price:
                 return False, f"TimesFM预测未来最低价 {forecast_low_min:.6f} 高于当前价，下跌空间不足"
 
@@ -639,9 +658,9 @@ def validate_signal(signal_type, symbol, current_price, rsi, adx, atr_pct, forec
 
 def estimate_hold_minutes(forecast_values, current_price, target_return_pct, side):
     if forecast_values is None or len(forecast_values) == 0:
-        return HORIZON * 3
+        return HORIZON * 5   # 5分钟 * 3步 = 15分钟
     price_seq = [current_price] + list(forecast_values[:HORIZON])
-    bar_minutes = 3
+    bar_minutes = 5
     for i in range(1, len(price_seq)):
         if side == 'long':
             ret = (price_seq[i] - current_price) / current_price
@@ -651,53 +670,45 @@ def estimate_hold_minutes(forecast_values, current_price, target_return_pct, sid
             return i * bar_minutes
     return HORIZON * bar_minutes
 
-# ==================== 新闻监控函数（已修正为 FMP stable 端点）====================
+# ==================== 新闻监控函数（使用 Finnhub）====================
 def check_news_impact(symbol):
     """
-    使用 Financial Modeling Prep 的 Crypto News API (stable 版本)
+    使用 Finnhub Crypto News API 检测突发新闻
     返回 (is_impacted, news_title)
     """
     if not ENABLE_NEWS_MONITOR:
         return False, ""
-    if not FMP_API_KEY:
+    if not FINNHUB_API_KEY:
         return False, ""
     
     coin = symbol.split('-')[0].upper()
-    
     try:
-        # 根据 FMP 官方文档，使用 /stable/news/crypto-latest 端点，并通过 symbols 参数过滤
-        url = "https://financialmodelingprep.com/stable/news/crypto-latest"
+        url = "https://finnhub.io/api/v1/news"
         params = {
-            "symbols": coin,
-            "limit": 5,
-            "apikey": FMP_API_KEY
+            "category": "crypto",
+            "token": FINNHUB_API_KEY
         }
         resp = requests.get(url, params=params, timeout=10)
         if resp.status_code != 200:
-            log(f"FMP API 响应异常: {resp.status_code} - {resp.text[:100]}")
+            log(f"Finnhub API 响应异常: {resp.status_code} - {resp.text[:100]}")
             return False, ""
-            
+        
         data = resp.json()
         now = datetime.now()
-        
-        for article in data:
-            # 兼容 publishedDate 或 date 字段
-            published_str = article.get('publishedDate') or article.get('date')
-            title = article.get('title', '')
-            
-            if published_str:
-                try:
-                    published = datetime.fromisoformat(published_str.replace('Z', '+00:00'))
-                    if (now - published.replace(tzinfo=None)).total_seconds() < NEWS_PAUSE_MINUTES * 60:
-                        log(f"📰 检测到相关新闻: {title[:50]}...")
-                        return True, title
-                except Exception as parse_err:
-                    log(f"解析新闻时间失败: {parse_err}")
-                    continue
-                    
+        for article in data[:10]:
+            headline = article.get('headline', '')
+            summary = article.get('summary', '')
+            # 检查是否包含当前币种
+            if coin in headline.upper() or coin in summary.upper():
+                published_time = article.get('datetime')  # UNIX timestamp
+                if published_time:
+                    published = datetime.fromtimestamp(published_time)
+                    if (now - published).total_seconds() < NEWS_PAUSE_MINUTES * 60:
+                        log(f"📰 Finnhub 检测到相关新闻: {headline[:50]}...")
+                        return True, headline
         return False, ""
     except Exception as e:
-        log(f"FMP 新闻 API 调用失败 {symbol}: {e}")
+        log(f"Finnhub 新闻 API 调用失败 {symbol}: {e}")
         return False, ""
 
 def check_volume_anomaly(symbol, current_price):
@@ -1032,7 +1043,7 @@ def predict_and_score(instId):
 def run_prediction_cycle():
     now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     log(f"\n============================================================")
-    log(f"🔄 [{now_str}] {BAR}周期 | 预测{HORIZON}步（{HORIZON*3}分钟） | 每{PREDICTION_INTERVAL/60:.1f}分钟一轮")
+    log(f"🔄 [{now_str}] {BAR}周期 | 预测{HORIZON}步（{HORIZON*5}分钟） | 每{PREDICTION_INTERVAL/60:.1f}分钟一轮")
     log(f"============================================================")
 
     symbols = get_all_swap_contracts()
@@ -1103,7 +1114,7 @@ def run_prediction_cycle():
             log(f"      预期涨跌: {res['expected_return']*100:+.2f}%")
             log(f"      R²: {res['r_squared']:.2f} | 一致性: {res['consistency']:.2f} | 方向置信度: {res['direction_confidence']:.2f} | 得分: {res['score']:.4f}")
             log(f"      技术指标: {res['tech_msg']}")
-            log(f"      预估持仓时间: {res.get('estimated_hold_minutes', 12)} 分钟")
+            log(f"      预估持仓时间: {res.get('estimated_hold_minutes', 15)} 分钟")
         else:
             long_score = 0.0
             short_score = 0.0
@@ -1176,7 +1187,7 @@ def run_prediction_cycle():
         score = row['score']
         price_info = row.get('price_info')
         tech_msg = row['tech_msg']
-        hold_min = row.get('estimated_hold_minutes', 12)
+        hold_min = row.get('estimated_hold_minutes', 15)
         msg.append(f"#{symbol} | {signal}")
         msg.append(f"  预期收益: {exp_return:+.2f}% | 置信度: {confidence:.2f} | 得分: {score:.4f}")
         msg.append(f"  预估持仓时间: {hold_min} 分钟（达到预期收益后平仓）")
@@ -1198,7 +1209,7 @@ def run_prediction_cycle():
         msg.append("")
     push_telegram("\n".join(msg))
 
-    output_dict = {row['symbol']: (row['signal'], row['expected_return'], row.get('estimated_hold_minutes', 12)) for _, row in top.iterrows()}
+    output_dict = {row['symbol']: (row['signal'], row['expected_return'], row.get('estimated_hold_minutes', 15)) for _, row in top.iterrows()}
     with open(OUTPUT_FILE, "w", encoding="utf-8") as f:
         json.dump({k: v[0] for k, v in output_dict.items()}, f, indent=2, ensure_ascii=False)
     return output_dict
@@ -1230,7 +1241,7 @@ class OKXTrader:
                     'trailing_activated': info.get('trailing_activated', False),
                     'expected_return': info.get('expected_return'),
                     'expected_met': info.get('expected_met', False),
-                    'expected_hold_minutes': info.get('expected_hold_minutes', 12)
+                    'expected_hold_minutes': info.get('expected_hold_minutes', 15)
                 }
             with open(STRATEGY_POSITIONS_FILE, 'w') as f:
                 json.dump(to_save, f, indent=2)
@@ -1260,7 +1271,7 @@ class OKXTrader:
                     'trailing_activated': info.get('trailing_activated', False),
                     'expected_return': info.get('expected_return'),
                     'expected_met': info.get('expected_met', False),
-                    'expected_hold_minutes': info.get('expected_hold_minutes', 12)
+                    'expected_hold_minutes': info.get('expected_hold_minutes', 15)
                 }
             log(f"📂 已加载 {len(self.strategy_positions)} 个策略持仓记录")
         except Exception as e:
@@ -1387,7 +1398,7 @@ class OKXTrader:
                             'trailing_activated': False,
                             'expected_return': None,
                             'expected_met': False,
-                            'expected_hold_minutes': 12
+                            'expected_hold_minutes': 15
                         }
                         self._save_strategy_positions()
                         log(f"🔄 接管孤儿持仓: {sym} {side.upper()} 已纳入管理")
@@ -1622,7 +1633,7 @@ class OKXTrader:
             margin = sig['margin']
             signal_price = sig['signal_price']
             expected_return = sig['expected_return']
-            hold_minutes = sig.get('expected_hold_minutes', 12)
+            hold_minutes = sig.get('expected_hold_minutes', 15)
             try:
                 ticker = self.exchange.fetch_ticker(raw_symbol)
                 current_price = ticker['last']
@@ -2036,7 +2047,7 @@ class OKXTrader:
             hold_seconds = time.time() - info['open_time']
             expected_return = info.get('expected_return', 0)
             expected_pct = abs(expected_return * 100) if expected_return else 0
-            expected_hold_minutes = info.get('expected_hold_minutes', 12)
+            expected_hold_minutes = info.get('expected_hold_minutes', 15)
             expected_hold_seconds = expected_hold_minutes * 60
 
             # 动态时间平仓：达到预估持仓时间后立即平仓，无论盈亏
@@ -2161,7 +2172,7 @@ def main():
     has_set_pending_this_cycle = False
 
     log("\n========== 全自动交易系统已启动 ==========")
-    push_telegram(f"🤖 交易机器人启动\nK线: {BAR} | 预测: {HORIZON}根 ({HORIZON*3}分钟) | 每{PREDICTION_INTERVAL/60:.1f}分钟一轮\n止盈: 动态止损+跟踪止损 | 最长持仓: 动态预测时间\n固定保证金: {MAX_SINGLE_TRADE_USDT} USDT/币\n流动性: 成交额≥{MIN_VOLUME_USDT/1_000_000:.0f}M, 市值≥{MIN_MARKET_CAP_USDT/1_000_000:.0f}M\n仓位模式: 逐仓 {LEVERAGE}x\n信号门槛: 置信度≥{MIN_DIRECTION_CONFIDENCE}, R²≥{MIN_R_SQUARED}\n技术指标: RSI周期{RSI_PERIOD} 多单<{RSI_LONG_THRESHOLD} 空单>{RSI_SHORT_THRESHOLD}; MACD({MACD_FAST},{MACD_SLOW},{MACD_SIGNAL})\n风控: 最多{MAX_CONCURRENT_POSITIONS}仓, 总保证金≤{MAX_TOTAL_MARGIN_RATIO*100}%权益\n开仓条件: 实体位置(顺势放宽)、有利移动、紧急动能、强势突破追单\n多空相对评分制 | 动态预期收益率: 顺势0.3% / 逆势0.8%\n持仓时间: 基于TimesFM预测路径动态估算，时间到强制平仓\n开仓前安全检查: 逆势信号检查1小时EMA20偏离、15分钟实体放大、成交量突增\n新闻监控: FMP Crypto News API (stable)\n大周期趋势过滤: 1小时/15分钟下跌趋势禁止开多，上涨趋势禁止开空")
+    push_telegram(f"🤖 交易机器人启动\nK线: {BAR} | 预测: {HORIZON}根 ({HORIZON*5}分钟) | 每{PREDICTION_INTERVAL/60:.1f}分钟一轮\n止盈: 动态止损+跟踪止损 | 最长持仓: 动态预测时间\n固定保证金: {MAX_SINGLE_TRADE_USDT} USDT/币\n流动性: 成交额≥{MIN_VOLUME_USDT/1_000_000:.0f}M, 市值≥{MIN_MARKET_CAP_USDT/1_000_000:.0f}M\n仓位模式: 逐仓 {LEVERAGE}x\n信号门槛: 置信度≥{MIN_DIRECTION_CONFIDENCE}, R²≥{MIN_R_SQUARED}\n技术指标: RSI周期{RSI_PERIOD} 多单<{RSI_LONG_THRESHOLD} 空单>{RSI_SHORT_THRESHOLD}; MACD({MACD_FAST},{MACD_SLOW},{MACD_SIGNAL})\n风控: 最多{MAX_CONCURRENT_POSITIONS}仓, 总保证金≤{MAX_TOTAL_MARGIN_RATIO*100}%权益\n开仓条件: 实体位置(顺势放宽)、有利移动、紧急动能、强势突破追单\n多空相对评分制 | 动态预期收益率: 顺势0.3% / 逆势0.8%\n持仓时间: 基于TimesFM预测路径动态估算，时间到强制平仓\n开仓前安全检查: 逆势信号检查1小时EMA20偏离、15分钟实体放大、成交量突增\n新闻监控: Finnhub Crypto News API (Free Tier)\n大周期趋势过滤: 1小时/15分钟下跌趋势禁止开多，上涨趋势禁止开空")
 
     while True:
         try:
