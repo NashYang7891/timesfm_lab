@@ -104,7 +104,7 @@ MAX_VOLUME_SPIKE_RATIO = 3.0          # 成交量突增超过3倍则拒绝
 SAFETY_TREND_BAR = "1h"               # 安全检查使用的K线周期
 
 # ==================== 新增功能参数 ====================
-ENABLE_NEWS_MONITOR = True             # 是否启用新闻监控（使用免费 Free Crypto News API）
+ENABLE_NEWS_MONITOR = True             # 是否启用新闻监控（使用 FMP 新闻 API）
 NEWS_PAUSE_MINUTES = 5                 # 新闻出现后暂停交易多少分钟
 ENABLE_VOLUME_ANOMALY = True           # 是否启用成交异动检测
 VOLUME_ANOMALY_THRESHOLD = 5.0         # 成交量突增倍数（相对于过去5根K线平均）
@@ -114,6 +114,9 @@ MOMENTUM_LIMIT_PCT = 1.5               # 最近3根K线累计涨幅/跌幅超过
 
 # 全局字典记录每个币种最后一次新闻影响的时间
 last_news_time = {}
+
+# FMP API 密钥（请重置密钥以保证安全）
+FMP_API_KEY = "PmZnEBk6HqpDEFVTjsjlSABaDo6VCrAA"
 
 # ==================== 3. Telegram推送 ====================
 def push_telegram(content):
@@ -657,32 +660,48 @@ def estimate_hold_minutes(forecast_values, current_price, target_return_pct, sid
 # ==================== 新增辅助功能函数 ====================
 def check_news_impact(symbol):
     """
-    使用完全免费的 Free Crypto News API 查询新闻（无需 API Key）
+    使用 Financial Modeling Prep 的加密货币新闻 API
     返回 (is_impacted, news_title)
     """
     if not ENABLE_NEWS_MONITOR:
         return False, ""
-    # 提取币种名称（去掉 -USDT-SWAP 后缀）
-    coin = symbol.split('-')[0]
+    if not FMP_API_KEY:
+        return False, ""
+    
+    coin = symbol.split('-')[0].upper()
+    
     try:
-        url = f"https://api.freecryptonews.com/v1/news?symbol={coin}&limit=5"
-        resp = requests.get(url, timeout=5)
-        if resp.status_code == 200:
-            data = resp.json()
-            # 检查最近 NEWS_PAUSE_MINUTES 分钟内的新闻
-            now = datetime.now()
-            for article in data.get('articles', []):
-                published_str = article.get('published_at')
-                if published_str:
-                    try:
-                        published = datetime.fromisoformat(published_str.replace('Z', '+00:00'))
-                        if (now - published).total_seconds() < NEWS_PAUSE_MINUTES * 60:
-                            return True, article.get('title', '')
-                    except:
-                        pass
+        url = "https://financialmodelingprep.com/api/v4/crypto_news"
+        params = {
+            "symbol": coin,
+            "limit": 5,
+            "apikey": FMP_API_KEY
+        }
+        resp = requests.get(url, params=params, timeout=10)
+        if resp.status_code != 200:
+            log(f"FMP API 响应异常: {resp.status_code}")
+            return False, ""
+            
+        data = resp.json()
+        now = datetime.now()
+        
+        for article in data:
+            published_str = article.get('publishedDate')
+            title = article.get('title', '')
+            
+            if published_str:
+                try:
+                    published = datetime.strptime(published_str, "%Y-%m-%d %H:%M:%S")
+                    if (now - published).total_seconds() < NEWS_PAUSE_MINUTES * 60:
+                        log(f"📰 检测到相关新闻: {title[:50]}...")
+                        return True, title
+                except Exception as parse_err:
+                    log(f"解析新闻时间失败: {parse_err}")
+                    continue
+                    
         return False, ""
     except Exception as e:
-        log(f"新闻API调用失败 {symbol}: {e}")
+        log(f"FMP 新闻 API 调用失败 {symbol}: {e}")
         return False, ""
 
 def check_volume_anomaly(symbol, current_price):
@@ -2209,7 +2228,7 @@ def main():
     has_set_pending_this_cycle = False
 
     log("\n========== 全自动交易系统已启动 ==========")
-    push_telegram(f"🤖 交易机器人启动\nK线: {BAR} | 预测: {HORIZON}根 ({HORIZON*3}分钟) | 每{PREDICTION_INTERVAL/60:.1f}分钟一轮\n止盈: 动态止损+跟踪止损 | 最长持仓: 动态预测时间\n固定保证金: {MAX_SINGLE_TRADE_USDT} USDT/币\n流动性: 成交额≥{MIN_VOLUME_USDT/1_000_000:.0f}M, 市值≥{MIN_MARKET_CAP_USDT/1_000_000:.0f}M\n仓位模式: 逐仓 {LEVERAGE}x\n信号门槛: 置信度≥{MIN_DIRECTION_CONFIDENCE}, R²≥{MIN_R_SQUARED}\n技术指标: RSI周期{RSI_PERIOD} 多单<{RSI_LONG_THRESHOLD} 空单>{RSI_SHORT_THRESHOLD}; MACD({MACD_FAST},{MACD_SLOW},{MACD_SIGNAL})\n风控: 最多{MAX_CONCURRENT_POSITIONS}仓, 总保证金≤{MAX_TOTAL_MARGIN_RATIO*100}%权益\n开仓条件: 实体位置(顺势放宽)、有利移动、紧急动能、强势突破追单\n多空相对评分制 | 动态预期收益率: 顺势0.3% / 逆势0.8%\n持仓时间: 基于TimesFM预测路径动态估算，时间到强制平仓\n开仓前安全检查: 逆势信号检查1小时EMA20偏离、15分钟实体放大、成交量突增\n新增功能: 免费新闻监控(Free Crypto News API)、成交异动检测、增强版趋势反转检测(顶部/底部形态)、价格动量过滤(1.5%)\n大周期趋势过滤: 1小时/15分钟下跌趋势禁止开多，上涨趋势禁止开空")
+    push_telegram(f"🤖 交易机器人启动\nK线: {BAR} | 预测: {HORIZON}根 ({HORIZON*3}分钟) | 每{PREDICTION_INTERVAL/60:.1f}分钟一轮\n止盈: 动态止损+跟踪止损 | 最长持仓: 动态预测时间\n固定保证金: {MAX_SINGLE_TRADE_USDT} USDT/币\n流动性: 成交额≥{MIN_VOLUME_USDT/1_000_000:.0f}M, 市值≥{MIN_MARKET_CAP_USDT/1_000_000:.0f}M\n仓位模式: 逐仓 {LEVERAGE}x\n信号门槛: 置信度≥{MIN_DIRECTION_CONFIDENCE}, R²≥{MIN_R_SQUARED}\n技术指标: RSI周期{RSI_PERIOD} 多单<{RSI_LONG_THRESHOLD} 空单>{RSI_SHORT_THRESHOLD}; MACD({MACD_FAST},{MACD_SLOW},{MACD_SIGNAL})\n风控: 最多{MAX_CONCURRENT_POSITIONS}仓, 总保证金≤{MAX_TOTAL_MARGIN_RATIO*100}%权益\n开仓条件: 实体位置(顺势放宽)、有利移动、紧急动能、强势突破追单\n多空相对评分制 | 动态预期收益率: 顺势0.3% / 逆势0.8%\n持仓时间: 基于TimesFM预测路径动态估算，时间到强制平仓\n开仓前安全检查: 逆势信号检查1小时EMA20偏离、15分钟实体放大、成交量突增\n新增功能: FMP新闻监控、成交异动检测、增强版趋势反转检测(顶部/底部形态)、价格动量过滤(1.5%)\n大周期趋势过滤: 1小时/15分钟下跌趋势禁止开多，上涨趋势禁止开空")
 
     while True:
         try:
