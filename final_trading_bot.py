@@ -134,7 +134,6 @@ def _build_timesfm_model():
     try:
         m = timesfm.TimesFM_2p5_200M_torch.from_pretrained("google/timesfm-2.5-200m-pytorch")
         m = m.to(device)
-        # 尝试编译加速（可选）
         try:
             m = torch.compile(m)
         except:
@@ -909,14 +908,31 @@ def predict_and_score(instId):
                     body_bottom = min(open_p, close)
                     body_len = body_top - body_bottom
                     if body_len > 0:
-                        long_entry_max = body_bottom + body_len * PRICE_POSITION_RATIO
-                        short_entry_min = body_top - body_len * PRICE_POSITION_RATIO
+                        is_with_trend = (best_side == 'long' and is_15m_uptrend) or (best_side == 'short' and is_15m_downtrend)
+                        if best_side == 'long':
+                            if is_with_trend:
+                                long_entry_max = body_top
+                                entry_desc = f"顺势多单，建议当前价 ≤ {body_top:.6f} (实体顶部)"
+                            else:
+                                long_entry_max = body_bottom + body_len * PRICE_POSITION_RATIO
+                                entry_desc = f"逆势多单，建议入场价 ≤ {long_entry_max:.6f} (实体底部+{PRICE_POSITION_RATIO*100:.0f}%区域)"
+                            short_entry_min = None
+                        else:
+                            if is_with_trend:
+                                short_entry_min = body_bottom
+                                entry_desc = f"顺势空单，建议当前价 ≥ {body_bottom:.6f} (实体底部)"
+                            else:
+                                short_entry_min = body_top - body_len * PRICE_POSITION_RATIO
+                                entry_desc = f"逆势空单，建议入场价 ≥ {short_entry_min:.6f} (实体顶部-{PRICE_POSITION_RATIO*100:.0f}%区域)"
+                            long_entry_max = None
                         price_info = {
                             'current_price': current_price,
                             'body_top': body_top,
                             'body_bottom': body_bottom,
                             'long_entry_max': long_entry_max,
-                            'short_entry_min': short_entry_min
+                            'short_entry_min': short_entry_min,
+                            'entry_desc': entry_desc,
+                            'is_with_trend': is_with_trend
                         }
                 hold_minutes = estimate_hold_minutes(forecast_values, current_price, abs(best_ret), best_side)
                 result = {
@@ -1051,14 +1067,32 @@ def predict_and_score(instId):
             body_bottom = min(open_p, close)
             body_len = body_top - body_bottom
             if body_len > 0:
-                long_entry_max = body_bottom + body_len * PRICE_POSITION_RATIO
-                short_entry_min = body_top - body_len * PRICE_POSITION_RATIO
+                # 判断当前信号是否顺势
+                is_with_trend = (best_side == 'long' and is_15m_uptrend) or (best_side == 'short' and is_15m_downtrend)
+                if best_side == 'long':
+                    if is_with_trend:
+                        long_entry_max = body_top
+                        entry_desc = f"顺势多单，建议当前价 ≤ {body_top:.6f} (实体顶部)"
+                    else:
+                        long_entry_max = body_bottom + body_len * PRICE_POSITION_RATIO
+                        entry_desc = f"逆势多单，建议入场价 ≤ {long_entry_max:.6f} (实体底部+{PRICE_POSITION_RATIO*100:.0f}%区域)"
+                    short_entry_min = None
+                else:  # short
+                    if is_with_trend:
+                        short_entry_min = body_bottom
+                        entry_desc = f"顺势空单，建议当前价 ≥ {body_bottom:.6f} (实体底部)"
+                    else:
+                        short_entry_min = body_top - body_len * PRICE_POSITION_RATIO
+                        entry_desc = f"逆势空单，建议入场价 ≥ {short_entry_min:.6f} (实体顶部-{PRICE_POSITION_RATIO*100:.0f}%区域)"
+                    long_entry_max = None
                 price_info = {
                     'current_price': current_price,
                     'body_top': body_top,
                     'body_bottom': body_bottom,
                     'long_entry_max': long_entry_max,
-                    'short_entry_min': short_entry_min
+                    'short_entry_min': short_entry_min,
+                    'entry_desc': entry_desc,
+                    'is_with_trend': is_with_trend
                 }
             else:
                 price_info = None
@@ -1247,19 +1281,20 @@ def run_prediction_cycle():
             body_top = price_info['body_top']
             msg.append(f"  当前价格: {current:.6f}")
             msg.append(f"  上一根K线实体区间: [{body_bottom:.6f} - {body_top:.6f}]")
-            if signal == 'LONG':
-                entry_max = price_info['long_entry_max']
-                msg.append(f"  建议多单入场: 价格 ≤ {entry_max:.6f} (实体底部+{PRICE_POSITION_RATIO*100:.0f}%区域)")
-            else:
-                entry_min = price_info['short_entry_min']
-                msg.append(f"  建议空单入场: 价格 ≥ {entry_min:.6f} (实体顶部-{PRICE_POSITION_RATIO*100:.0f}%区域)")
+            entry_desc = price_info.get('entry_desc', '')
+            if entry_desc:
+                msg.append(f"  {entry_desc}")
+            elif signal == 'LONG' and price_info.get('long_entry_max'):
+                msg.append(f"  建议多单入场: 价格 ≤ {price_info['long_entry_max']:.6f}")
+            elif signal == 'SHORT' and price_info.get('short_entry_min'):
+                msg.append(f"  建议空单入场: 价格 ≥ {price_info['short_entry_min']:.6f}")
         else:
             msg.append("  ⚠️ 无法获取价格位置信息")
         msg.append(f"  技术确认: {tech_msg}")
         msg.append("")
     push_telegram("\n".join(msg))
 
-    # 修改：保存信号时带上方向置信度
+    # 保存信号时带上方向置信度
     output_dict = {row['symbol']: (row['signal'], row['expected_return'], row.get('estimated_hold_minutes', 15), row['direction_confidence']) for _, row in top.iterrows()}
     with open(OUTPUT_FILE, "w", encoding="utf-8") as f:
         json.dump({k: v[0] for k, v in output_dict.items()}, f, indent=2, ensure_ascii=False)
@@ -2344,7 +2379,6 @@ def main():
                             push_telegram(f"⚠️ 当前已有 {current_positions_count} 个策略持仓，达到上限 {MAX_CONCURRENT_POSITIONS}，本次信号暂不开仓")
                         else:
                             available_balance = trader.get_available_balance()
-                            # 不再使用固定 open_amount，每个信号单独计算保证金
                             existing_symbols = set(trader.strategy_positions.keys())
                             filtered_signals = {sym: (sig, exp_ret, hold_min, conf) for sym, (sig, exp_ret, hold_min, conf) in signals_dict.items() 
                                                 if sym not in existing_symbols}
