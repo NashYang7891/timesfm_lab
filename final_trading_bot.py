@@ -126,11 +126,19 @@ def push_telegram(content):
 # ==================== 4. TimesFM模型 ====================
 log("🚀 加载 TimesFM 模型...")
 torch.set_float32_matmul_precision("high")
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+log(f"使用设备: {device}")
 
 def _build_timesfm_model():
     errors = []
     try:
         m = timesfm.TimesFM_2p5_200M_torch.from_pretrained("google/timesfm-2.5-200m-pytorch")
+        m = m.to(device)
+        # 尝试编译加速（可选）
+        try:
+            m = torch.compile(m)
+        except:
+            pass
         try:
             fc = timesfm.ForecastConfig(max_context=8192, max_horizon=512)
             m.compile(forecast_config=fc)
@@ -815,7 +823,7 @@ def predict_and_score(instId):
         else:
             vol_ratio = 1.0
 
-        with torch.no_grad():
+        with torch.inference_mode():
             try:
                 point, _ = model.forecast(horizon=HORIZON, inputs=[ts])
                 forecast_values = np.array(point[0], dtype=np.float32)
@@ -1251,7 +1259,8 @@ def run_prediction_cycle():
         msg.append("")
     push_telegram("\n".join(msg))
 
-    output_dict = {row['symbol']: (row['signal'], row['expected_return'], row.get('estimated_hold_minutes', 15)) for _, row in top.iterrows()}
+    # 修改：保存信号时带上方向置信度
+    output_dict = {row['symbol']: (row['signal'], row['expected_return'], row.get('estimated_hold_minutes', 15), row['direction_confidence']) for _, row in top.iterrows()}
     with open(OUTPUT_FILE, "w", encoding="utf-8") as f:
         json.dump({k: v[0] for k, v in output_dict.items()}, f, indent=2, ensure_ascii=False)
     return output_dict
@@ -1333,6 +1342,8 @@ class OKXTrader:
             "proxies": proxies,
             "options": {"defaultType": "swap"}
         })
+        # 调整速率限制，提高并发性能
+        ex.rateLimit = 100  # 毫秒，原默认1000ms
         ex.set_sandbox_mode(IS_SANDBOX)
         for attempt in range(3):
             try:
@@ -1597,9 +1608,12 @@ class OKXTrader:
             pct_change = (current_price - signal_price) / signal_price * 100
             return pct_change >= FAVORABLE_MOVE_PCT, pct_change
 
-    def set_pending_signals(self, signals_list, margin_amount):
+    def set_pending_signals(self, signals_list):
+        """
+        signals_list: list of (raw_symbol, side, expected_return, hold_minutes, margin_amount)
+        """
         self.pending_signals = []
-        for raw_symbol, side, expected_return, hold_minutes in signals_list:
+        for raw_symbol, side, expected_return, hold_minutes, margin_amount in signals_list:
             try:
                 market = self.exchange.market(raw_symbol)
                 ccxt_symbol = market['symbol']
@@ -2330,20 +2344,26 @@ def main():
                             push_telegram(f"⚠️ 当前已有 {current_positions_count} 个策略持仓，达到上限 {MAX_CONCURRENT_POSITIONS}，本次信号暂不开仓")
                         else:
                             available_balance = trader.get_available_balance()
-                            open_amount = MAX_SINGLE_TRADE_USDT
-                            if available_balance < open_amount + 5:
-                                push_telegram(f"⚠️ 可用余额不足 {open_amount} USDT（可用: {available_balance:.2f}），无法开仓")
-                            else:
-                                existing_symbols = set(trader.strategy_positions.keys())
-                                filtered_signals = {sym: (sig, exp_ret, hold_min) for sym, (sig, exp_ret, hold_min) in signals_dict.items() 
-                                                    if sym not in existing_symbols}
-                                if filtered_signals:
-                                    signals_list = [(sym, sig, exp_ret, hold_min) for sym, (sig, exp_ret, hold_min) in filtered_signals.items()]
-                                    trader.set_pending_signals(signals_list, open_amount)
+                            # 不再使用固定 open_amount，每个信号单独计算保证金
+                            existing_symbols = set(trader.strategy_positions.keys())
+                            filtered_signals = {sym: (sig, exp_ret, hold_min, conf) for sym, (sig, exp_ret, hold_min, conf) in signals_dict.items() 
+                                                if sym not in existing_symbols}
+                            if filtered_signals:
+                                signals_list = []
+                                for sym, (sig, exp_ret, hold_min, conf) in filtered_signals.items():
+                                    margin_amount = 50 if conf > 0.95 else 30
+                                    if margin_amount > available_balance:
+                                        push_telegram(f"⚠️ 余额不足，跳过信号 {sym} 需要 {margin_amount} U")
+                                        continue
+                                    signals_list.append((sym, sig, exp_ret, hold_min, margin_amount))
+                                if signals_list:
+                                    trader.set_pending_signals(signals_list)
                                     has_set_pending_this_cycle = True
-                                    push_telegram(f"📋 已设置待开仓信号，将在价格满足条件时开仓，保证金: {open_amount:.2f} USDT/币")
+                                    push_telegram(f"📋 已设置 {len(signals_list)} 个待开仓信号（高信50U，普通30U）")
                                 else:
-                                    push_telegram(f"⚠️ 所有信号币种均已有持仓，本次无新开仓")
+                                    push_telegram(f"⚠️ 所有信号币种均已有持仓或余额不足，本次无新开仓")
+                            else:
+                                push_telegram(f"⚠️ 所有信号币种均已有持仓，本次无新开仓")
 
             all_pos = trader.sync_positions()
             strategy_symbols = list(trader.strategy_positions.keys())
