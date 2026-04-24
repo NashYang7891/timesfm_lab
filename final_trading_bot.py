@@ -863,7 +863,9 @@ def predict_and_score(instId):
         except:
             rsi_val = 50
 
-        macd_line, signal_line, hist, _ = compute_macd(ts, MACD_FAST, MACD_SLOW, MACD_SIGNAL)
+        # 修复：将 numpy 数组转为 Series 再传给 MACD 函数
+        ts_series = pd.Series(ts)
+        macd_line, signal_line, hist, _ = compute_macd(ts_series, MACD_FAST, MACD_SLOW, MACD_SIGNAL)
 
         if is_15m_uptrend:
             min_ret_long = TREND_FOLLOWING_RETURN
@@ -2308,6 +2310,10 @@ def main():
             trader.check_and_open_pending()
             trader.check_manual_open()
 
+            # 检查是否允许开新仓（通过文件控制）
+            disable_file = "/tmp/disable_new_trades"
+            disable_trading = os.path.exists(disable_file)
+
             if (now - last_pred).total_seconds() >= PREDICTION_INTERVAL:
                 has_set_pending_this_cycle = False
                 signals_dict = run_prediction_cycle()
@@ -2315,25 +2321,29 @@ def main():
                 trader.clear_pending_signals()
 
                 if signals_dict and not has_set_pending_this_cycle:
-                    current_positions_count = len(trader.strategy_positions)
-                    if current_positions_count >= MAX_CONCURRENT_POSITIONS:
-                        push_telegram(f"⚠️ 当前已有 {current_positions_count} 个策略持仓，达到上限 {MAX_CONCURRENT_POSITIONS}，本次信号暂不开仓")
+                    if disable_trading:
+                        log("⏸️ 检测到禁用开仓标志文件，跳过本轮开仓")
+                        push_telegram("⏸️ 新开仓已手动暂停（检测到 /tmp/disable_new_trades）")
                     else:
-                        available_balance = trader.get_available_balance()
-                        open_amount = MAX_SINGLE_TRADE_USDT
-                        if available_balance < open_amount + 5:
-                            push_telegram(f"⚠️ 可用余额不足 {open_amount} USDT（可用: {available_balance:.2f}），无法开仓")
+                        current_positions_count = len(trader.strategy_positions)
+                        if current_positions_count >= MAX_CONCURRENT_POSITIONS:
+                            push_telegram(f"⚠️ 当前已有 {current_positions_count} 个策略持仓，达到上限 {MAX_CONCURRENT_POSITIONS}，本次信号暂不开仓")
                         else:
-                            existing_symbols = set(trader.strategy_positions.keys())
-                            filtered_signals = {sym: (sig, exp_ret, hold_min) for sym, (sig, exp_ret, hold_min) in signals_dict.items() 
-                                                if sym not in existing_symbols}
-                            if filtered_signals:
-                                signals_list = [(sym, sig, exp_ret, hold_min) for sym, (sig, exp_ret, hold_min) in filtered_signals.items()]
-                                trader.set_pending_signals(signals_list, open_amount)
-                                has_set_pending_this_cycle = True
-                                push_telegram(f"📋 已设置待开仓信号，将在价格满足条件时开仓，保证金: {open_amount:.2f} USDT/币")
+                            available_balance = trader.get_available_balance()
+                            open_amount = MAX_SINGLE_TRADE_USDT
+                            if available_balance < open_amount + 5:
+                                push_telegram(f"⚠️ 可用余额不足 {open_amount} USDT（可用: {available_balance:.2f}），无法开仓")
                             else:
-                                push_telegram(f"⚠️ 所有信号币种均已有持仓，本次无新开仓")
+                                existing_symbols = set(trader.strategy_positions.keys())
+                                filtered_signals = {sym: (sig, exp_ret, hold_min) for sym, (sig, exp_ret, hold_min) in signals_dict.items() 
+                                                    if sym not in existing_symbols}
+                                if filtered_signals:
+                                    signals_list = [(sym, sig, exp_ret, hold_min) for sym, (sig, exp_ret, hold_min) in filtered_signals.items()]
+                                    trader.set_pending_signals(signals_list, open_amount)
+                                    has_set_pending_this_cycle = True
+                                    push_telegram(f"📋 已设置待开仓信号，将在价格满足条件时开仓，保证金: {open_amount:.2f} USDT/币")
+                                else:
+                                    push_telegram(f"⚠️ 所有信号币种均已有持仓，本次无新开仓")
 
             all_pos = trader.sync_positions()
             strategy_symbols = list(trader.strategy_positions.keys())
