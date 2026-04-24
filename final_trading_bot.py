@@ -126,18 +126,11 @@ def push_telegram(content):
 # ==================== 4. TimesFM模型 ====================
 log("🚀 加载 TimesFM 模型...")
 torch.set_float32_matmul_precision("high")
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-log(f"使用设备: {device}")
 
 def _build_timesfm_model():
     errors = []
     try:
         m = timesfm.TimesFM_2p5_200M_torch.from_pretrained("google/timesfm-2.5-200m-pytorch")
-        m = m.to(device)
-        try:
-            m = torch.compile(m)
-        except:
-            pass
         try:
             fc = timesfm.ForecastConfig(max_context=8192, max_horizon=512)
             m.compile(forecast_config=fc)
@@ -822,7 +815,7 @@ def predict_and_score(instId):
         else:
             vol_ratio = 1.0
 
-        with torch.inference_mode():
+        with torch.no_grad():
             try:
                 point, _ = model.forecast(horizon=HORIZON, inputs=[ts])
                 forecast_values = np.array(point[0], dtype=np.float32)
@@ -1377,8 +1370,8 @@ class OKXTrader:
             "proxies": proxies,
             "options": {"defaultType": "swap"}
         })
-        # 调整速率限制，提高并发性能
-        ex.rateLimit = 100  # 毫秒，原默认1000ms
+        # 调整速率限制
+        ex.rateLimit = 100
         ex.set_sandbox_mode(IS_SANDBOX)
         for attempt in range(3):
             try:
@@ -2324,7 +2317,7 @@ class OKXTrader:
                 'lowest_price': open_price,
                 'trailing_stop_pct': TRAILING_STOP_PCT,
                 'trailing_activated': False,
-                'expected_return': 0.003,                    # 默认预期收益0.3%，仅用于超时判断（但超时时间极大）
+                'expected_return': 0.003,                    # 默认预期收益0.3%，仅用于超时判断
                 'expected_met': False,
                 'expected_hold_minutes': 999999,             # 永不超时
                 'half_closed': False
