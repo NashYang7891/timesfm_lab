@@ -863,7 +863,6 @@ def predict_and_score(instId):
         except:
             rsi_val = 50
 
-        # 修复：将 numpy 数组转为 Series 再传给 MACD 函数
         ts_series = pd.Series(ts)
         macd_line, signal_line, hist, _ = compute_macd(ts_series, MACD_FAST, MACD_SLOW, MACD_SIGNAL)
 
@@ -1060,7 +1059,6 @@ def predict_and_score(instId):
             body_bottom = min(open_p, close)
             body_len = body_top - body_bottom
             if body_len > 0:
-                # 判断当前信号是否顺势
                 is_with_trend = (best_side == 'long' and is_15m_uptrend) or (best_side == 'short' and is_15m_downtrend)
                 if best_side == 'long':
                     if is_with_trend:
@@ -1070,7 +1068,7 @@ def predict_and_score(instId):
                         long_entry_max = body_bottom + body_len * PRICE_POSITION_RATIO
                         entry_desc = f"逆势多单，建议入场价 ≤ {long_entry_max:.6f} (实体底部+{PRICE_POSITION_RATIO*100:.0f}%区域)"
                     short_entry_min = None
-                else:  # short
+                else:
                     if is_with_trend:
                         short_entry_min = body_bottom
                         entry_desc = f"顺势空单，建议当前价 ≥ {body_bottom:.6f} (实体底部)"
@@ -1287,7 +1285,6 @@ def run_prediction_cycle():
         msg.append("")
     push_telegram("\n".join(msg))
 
-    # 保存信号时带上方向置信度
     output_dict = {row['symbol']: (row['signal'], row['expected_return'], row.get('estimated_hold_minutes', 15), row['direction_confidence']) for _, row in top.iterrows()}
     with open(OUTPUT_FILE, "w", encoding="utf-8") as f:
         json.dump({k: v[0] for k, v in output_dict.items()}, f, indent=2, ensure_ascii=False)
@@ -1370,7 +1367,6 @@ class OKXTrader:
             "proxies": proxies,
             "options": {"defaultType": "swap"}
         })
-        # 调整速率限制
         ex.rateLimit = 100
         ex.set_sandbox_mode(IS_SANDBOX)
         for attempt in range(3):
@@ -1508,36 +1504,20 @@ class OKXTrader:
             pass
 
     def set_leverage(self, symbol, leverage=LEVERAGE):
-        try:
-            body = {
-                "instId": symbol,
-                "lever": str(leverage),
-                "mgnMode": "isolated"
-            }
-            timestamp = str(int(time.time() * 1000))
-            method = 'POST'
-            request_path = '/api/v5/account/set-leverage'
-            body_json = json.dumps(body)
-            message = timestamp + method + request_path + body_json
-            signature = base64.b64encode(
-                hmac.new(API_SECRET.encode('utf-8'), message.encode('utf-8'), hashlib.sha256).digest()
-            ).decode('utf-8')
-            headers = {
-                'OK-ACCESS-KEY': API_KEY,
-                'OK-ACCESS-SIGN': signature,
-                'OK-ACCESS-TIMESTAMP': timestamp,
-                'OK-ACCESS-PASSPHRASE': API_PASS,
-                'Content-Type': 'application/json'
-            }
-            url = "https://www.okx.com" + request_path
-            response = requests.post(url, headers=headers, data=body_json, timeout=5)
-            result = response.json()
-            if result.get('code') == '0':
-                log(f"设置杠杆 {symbol} {leverage}x 逐仓成功")
-            else:
-                err(f"设置杠杆失败 {symbol}: {result}")
-        except Exception as e:
-            err(f"设置杠杆异常 {symbol}: {e}")
+        """设置逐仓杠杆，使用 CCXT 内置方法 + 重试"""
+        for attempt in range(3):
+            try:
+                self.exchange.set_leverage(leverage, symbol, params={"mgnMode": "isolated"})
+                log(f"✅ 设置杠杆 {symbol} {leverage}x 逐仓成功 (尝试 {attempt+1})")
+                return True
+            except Exception as e:
+                err(f"设置杠杆失败 {symbol} (尝试 {attempt+1}/3): {e}")
+                if attempt < 2:
+                    time.sleep(1)
+                else:
+                    push_telegram(f"⚠️ 设置杠杆失败 {symbol}，将使用现有杠杆，请手动检查")
+                    return False
+        return False
 
     def get_atr(self, symbol, period=ATR_PERIOD):
         try:
@@ -1637,9 +1617,6 @@ class OKXTrader:
             return pct_change >= FAVORABLE_MOVE_PCT, pct_change
 
     def set_pending_signals(self, signals_list):
-        """
-        signals_list: list of (raw_symbol, side, expected_return, hold_minutes, margin_amount)
-        """
         self.pending_signals = []
         for raw_symbol, side, expected_return, hold_minutes, margin_amount in signals_list:
             try:
@@ -1847,8 +1824,8 @@ class OKXTrader:
             push_telegram(f"⚠️ 保证金占用超限，当前占用 {total_margin_used:.2f} U，权益 {equity:.2f} U")
             return False
 
+        self.set_leverage(symbol)
         try:
-            self.set_leverage(symbol)
             if side == 'long':
                 order_side = 'buy'
                 position_side = 'long'
@@ -2042,17 +2019,28 @@ class OKXTrader:
         open_margin = pos_info['open_margin']
         hold_seconds = time.time() - open_time
 
+        # 获取账户持仓模式
+        try:
+            account_config = self.exchange.private_get_account_config()
+            pos_mode = account_config['data'][0]['posMode']
+            log(f"当前持仓模式: {pos_mode}")
+        except Exception as e:
+            err(f"获取账户模式失败，使用默认双向持仓模式: {e}")
+            pos_mode = 'long_short_mode'
+
         try:
             order_side = 'sell' if side == 'long' else 'buy'
+            params = {'reduceOnly': True, 'tdMode': 'isolated'}
+            if pos_mode == 'long_short_mode':
+                params['posSide'] = 'long' if side == 'long' else 'short'
+            # 单边模式不传 posSide
+
             order = self.exchange.create_order(
                 symbol=ccxt_symbol,
                 type='market',
                 side=order_side,
                 amount=abs(open_qty),
-                params={
-                    'reduceOnly': True,
-                    'posSide': side.capitalize()
-                }
+                params=params
             )
             close_price = order.get('average', 0)
             if close_price == 0:
@@ -2065,28 +2053,38 @@ class OKXTrader:
             return True
         except Exception as e:
             err(f"平仓失败 {ccxt_symbol}: {e}")
+            # 备用方案：从交易所获取实际持仓再平
             try:
                 positions = self.exchange.fetch_positions()
                 for p in positions:
                     if p['symbol'] == ccxt_symbol and float(p.get('contracts', 0)) != 0:
                         actual_qty = abs(float(p['contracts']))
-                        order_side = 'sell' if side == 'long' else 'buy'
+                        actual_side = 'long' if float(p.get('contracts', 0)) > 0 else 'short'
+                        order_side = 'sell' if actual_side == 'long' else 'buy'
+                        params = {'reduceOnly': True, 'tdMode': 'isolated'}
+                        try:
+                            account_config = self.exchange.private_get_account_config()
+                            pos_mode = account_config['data'][0]['posMode']
+                        except:
+                            pos_mode = 'long_short_mode'
+                        if pos_mode == 'long_short_mode':
+                            params['posSide'] = actual_side
                         self.exchange.create_order(
                             symbol=ccxt_symbol,
                             type='market',
                             side=order_side,
                             amount=actual_qty,
-                            params={'reduceOnly': True, 'posSide': side.capitalize()}
+                            params=params
                         )
                         del self.strategy_positions[ccxt_symbol]
                         self._save_strategy_positions()
                         log(f"✅ 备用平仓成功 {ccxt_symbol}")
                         return True
-                    else:
-                        del self.strategy_positions[ccxt_symbol]
-                        self._save_strategy_positions()
-                        log(f"⚠️ 交易所无 {ccxt_symbol} 持仓，已清理本地记录")
-                        return True
+                # 无持仓，清理记录
+                del self.strategy_positions[ccxt_symbol]
+                self._save_strategy_positions()
+                log(f"⚠️ 交易所无 {ccxt_symbol} 持仓，已清理本地记录")
+                return True
             except Exception as e2:
                 err(f"备用平仓也失败 {ccxt_symbol}: {e2}")
             return False
@@ -2095,25 +2093,35 @@ class OKXTrader:
         if ccxt_symbol not in self.strategy_positions:
             return False
         info = self.strategy_positions[ccxt_symbol]
+        side = info['side']
         current_qty = info['open_qty']
         half_qty = current_qty / 2.0
         if half_qty < 0.01:
             return False
         try:
-            order_side = 'sell' if info['side'] == 'long' else 'buy'
+            account_config = self.exchange.private_get_account_config()
+            pos_mode = account_config['data'][0]['posMode']
+        except Exception as e:
+            err(f"获取账户模式失败，默认双向: {e}")
+            pos_mode = 'long_short_mode'
+        try:
+            order_side = 'sell' if side == 'long' else 'buy'
+            params = {'reduceOnly': True, 'tdMode': 'isolated'}
+            if pos_mode == 'long_short_mode':
+                params['posSide'] = 'long' if side == 'long' else 'short'
             self.exchange.create_order(
                 symbol=ccxt_symbol,
                 type='market',
                 side=order_side,
                 amount=half_qty,
-                params={'reduceOnly': True, 'posSide': info['side'].capitalize()}
+                params=params
             )
             info['open_qty'] -= half_qty
             ratio = info['open_qty'] / (info['open_qty'] + half_qty)
             info['open_margin'] *= ratio
             info['half_closed'] = True
             self._save_strategy_positions()
-            push_telegram(f"✂️ 部分平仓 {ccxt_symbol} {info['side']}\n数量: {half_qty} 张\n原因: {reason}")
+            push_telegram(f"✂️ 部分平仓 {ccxt_symbol} {side}\n数量: {half_qty} 张\n原因: {reason}")
             return True
         except Exception as e:
             err(f"部分平仓失败: {e}")
@@ -2196,7 +2204,6 @@ class OKXTrader:
                 trough = info.get('lowest_price', info['open_price'])
                 drawdown_pct = (current_price - trough) / trough * 100 if trough > 0 else 0
 
-            # 跟踪止损：浮盈 > 3% 自动激活
             trailing_pct = info.get('trailing_stop_pct', TRAILING_STOP_PCT)
             if pnl_percent > 3.0:
                 info['trailing_activated'] = True
@@ -2206,7 +2213,6 @@ class OKXTrader:
                 closed_any = True
                 continue
 
-            # 超时分级处理（仅对非接管仓位有效，接管仓位 expected_hold_minutes 极大）
             if hold_seconds >= expected_hold_minutes * 60:
                 if pnl_percent > 20.0 and not info.get('half_closed', False):
                     self._half_close_position(sym, reason=f"超时浮盈{pnl_percent:.1f}%减半")
@@ -2227,7 +2233,6 @@ class OKXTrader:
                     closed_any = True
                     continue
 
-            # 初始动态止损（仅当未禁用且未超过超时）
             stop_price = info.get('stop_loss_price')
             if stop_price is not None:
                 if (info['side'] == 'long' and current_price <= stop_price) or \
@@ -2271,7 +2276,6 @@ class OKXTrader:
             self.last_positions = self.sync_positions()
 
     def check_manual_open(self):
-        """检查并自动接管所有未被策略管理的持仓（包括人工开仓和策略开仓但记录丢失的情况）"""
         current_positions = self.sync_positions()
         for sym, side in current_positions.items():
             if sym not in self.strategy_positions:
@@ -2281,7 +2285,6 @@ class OKXTrader:
         self.last_positions = current_positions.copy()
 
     def _adopt_position(self, sym, side):
-        """接管一个现有的持仓，不设初始止损，只依靠跟踪止盈（基于原始开仓价），超时不平仓"""
         try:
             pos = None
             for p in self.exchange.fetch_positions():
@@ -2304,7 +2307,6 @@ class OKXTrader:
             ticker = self.exchange.fetch_ticker(sym)
             current_price = ticker['last']
 
-            # 接管仓位：不设初始止损，只靠跟踪止盈；超时时间设为极大值，永不超时平仓
             self.strategy_positions[sym] = {
                 'side': side,
                 'open_price': open_price,
@@ -2312,14 +2314,14 @@ class OKXTrader:
                 'open_qty': contracts,
                 'open_margin': margin,
                 'open_nominal': contracts * open_price,
-                'stop_loss_price': None,                     # 无初始止损
+                'stop_loss_price': None,
                 'highest_price': open_price,
                 'lowest_price': open_price,
                 'trailing_stop_pct': TRAILING_STOP_PCT,
                 'trailing_activated': False,
-                'expected_return': 0.003,                    # 默认预期收益0.3%，仅用于超时判断
+                'expected_return': 0.003,
                 'expected_met': False,
-                'expected_hold_minutes': 999999,             # 永不超时
+                'expected_hold_minutes': 999999,
                 'half_closed': False
             }
             self._save_strategy_positions()
@@ -2341,7 +2343,7 @@ def main():
     has_set_pending_this_cycle = False
 
     log("\n========== 全自动交易系统已启动 ==========")
-    push_telegram(f"🤖 交易机器人启动\nK线: {BAR} | 预测: {HORIZON}根 ({HORIZON*5}分钟) | 每{PREDICTION_INTERVAL/60:.1f}分钟一轮\n止盈: 动态止损+跟踪止损 | 最长持仓: 动态预测时间\n固定保证金: {MAX_SINGLE_TRADE_USDT} USDT/币\n流动性: 成交额≥{MIN_VOLUME_USDT/1_000_000:.0f}M, 市值≥{MIN_MARKET_CAP_USDT/1_000_000:.0f}M\n仓位模式: 逐仓 {LEVERAGE}x\n信号门槛: 置信度≥{MIN_DIRECTION_CONFIDENCE}, R²≥{MIN_R_SQUARED}\n技术指标: RSI周期{RSI_PERIOD} 多单<{RSI_LONG_THRESHOLD} 空单>{RSI_SHORT_THRESHOLD}; MACD({MACD_FAST},{MACD_SLOW},{MACD_SIGNAL})\n风控: 最多{MAX_CONCURRENT_POSITIONS}仓, 总保证金≤{MAX_TOTAL_MARGIN_RATIO*100}%权益\n开仓条件: 实体位置(顺势放宽)、有利移动、紧急动能、强势突破追单\n多空相对评分制 | 动态预期收益率: 顺势0.3% / 逆势0.8%\n持仓时间: 基于TimesFM预测路径动态估算，超时智能处理（盈利则跟踪止盈，亏损则止损，横盘则平仓）\n开仓前安全检查: 逆势信号检查1小时EMA20偏离、15分钟实体放大、成交量突增\n新闻监控: Finnhub Crypto News API (Free Tier)\n大周期趋势过滤: 1小时/15分钟下跌趋势禁止开多，上涨趋势禁止开空")
+    push_telegram(f"🤖 交易机器人启动\nK线: {BAR} | 预测: {HORIZON}根 ({HORIZON*5}分钟) | 每{PREDICTION_INTERVAL/60:.1f}分钟一轮\n止盈: 动态止损+跟踪止损 | 最长持仓: 动态预测时间\n固定保证金: {MAX_SINGLE_TRADE_USDT} USDT/币\n流动性: 成交额≥{MIN_VOLUME_USDT/1_000_000:.0f}M, 市值≥{MIN_MARKET_CAP_USDT/1_000_000:.0f}M\n仓位模式: 逐仓 {LEVERAGE}x\n信号门槛: 置信度≥{MIN_DIRECTION_CONFIDENCE}, R²≥{MIN_R_SQUARED}\n技术指标: RSI周期{RSI_PERIOD} 多单<{RSI_LONG_THRESHOLD} 空单>{RSI_SHORT_THRESHOLD}; MACD({MACD_FAST},{MACD_SLOW},{MACD_SIGNAL})\n风控: 最多{MAX_CONCURRENT_POSITIONS}仓, 总保证金≤{MAX_TOTAL_MARGIN_RATIO*100}%权益\n开仓条件: 实体位置(顺势放宽)、有利移动、紧急动能、强势突破追单\n多空相对评分制 | 动态预期收益率: 顺势0.3% / 逆势0.8%\n持仓时间: 基于TimesFM预测路径动态估算，超时智能处理\n开仓前安全检查: 逆势信号检查1小时EMA20偏离、15分钟实体放大、成交量突增\n新闻监控: Finnhub Crypto News API\n大周期趋势过滤: 1小时/15分钟下跌趋势禁止开多，上涨趋势禁止开空")
 
     while True:
         try:
@@ -2352,7 +2354,6 @@ def main():
             trader.check_and_open_pending()
             trader.check_manual_open()
 
-            # 检查是否允许开新仓（通过文件控制）
             disable_file = "/tmp/disable_new_trades"
             disable_trading = os.path.exists(disable_file)
 
