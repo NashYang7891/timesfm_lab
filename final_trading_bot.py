@@ -74,7 +74,8 @@ def setup_trading_logs(log_dir="/root/timesfm_lab", max_bytes=10*1024*1024, back
     }
 
 # 初始化日志器
-loggers = setup_trading_logs("/root/timesfm_lab")
+log_dir = "/root/timesfm_lab"
+loggers = setup_trading_logs(log_dir)
 log_trade = loggers["trade"].info
 log_signal = loggers["signal"].info
 log_signal_debug = loggers["signal"].debug
@@ -2501,3 +2502,4 @@ if __name__ == "__main__":
         if trader_obj:
             trader_obj.close_all()
         push_telegram("🛑 交易机器人已停止")
+
