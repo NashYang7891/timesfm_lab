@@ -9,6 +9,7 @@ import time
 import traceback
 import sys
 import logging
+import logging.handlers
 import ccxt
 import os
 import timesfm
@@ -18,22 +19,83 @@ import hmac
 import hashlib
 import re
 
-# ==================== 1. 全局配置 & 日志初始化 ====================
-if sys.stdout.encoding != 'utf-8':
-    sys.stdout.reconfigure(encoding='utf-8')
+# ==================== 1. 全局日志配置（分模块 + 自动轮转） ====================
+def setup_trading_logs(log_dir="/root/timesfm_lab", max_bytes=10*1024*1024, backup_count=5):
+    if not os.path.exists(log_dir): os.makedirs(log_dir)
 
-warnings.filterwarnings('ignore')
-log_dir = "/root/timesfm_lab"
-if not os.path.exists(log_dir): os.makedirs(log_dir)
+    fmt = logging.Formatter(
+        "%(asctime)s | %(levelname)-8s | %(name)-10s | %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S"
+    )
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
-    handlers=[logging.FileHandler(f"{log_dir}/trading_bot.log", encoding="utf-8"), logging.StreamHandler()]
-)
-log = logging.info
-err = logging.error
+    root = logging.getLogger()
+    root.setLevel(logging.DEBUG)
+
+    # 控制台：仅显示 INFO 及以上，简洁输出
+    console = logging.StreamHandler()
+    console.setLevel(logging.INFO)
+    console.setFormatter(logging.Formatter("%(asctime)s | %(message)s", datefmt="%H:%M:%S"))
+    root.addHandler(console)
+
+    # TRADE 日志
+    trade_log = logging.getLogger("TRADE")
+    trade_log.setLevel(logging.INFO)
+    trade_h = logging.handlers.RotatingFileHandler(
+        f"{log_dir}/trades.log", maxBytes=max_bytes, backupCount=backup_count, encoding="utf-8"
+    )
+    trade_h.setFormatter(fmt)
+    trade_log.addHandler(trade_h)
+    trade_log.propagate = False
+
+    # SIGNAL 日志
+    signal_log = logging.getLogger("SIGNAL")
+    signal_log.setLevel(logging.DEBUG)
+    signal_h = logging.handlers.RotatingFileHandler(
+        f"{log_dir}/signals.log", maxBytes=max_bytes, backupCount=backup_count, encoding="utf-8"
+    )
+    signal_h.setFormatter(fmt)
+    signal_log.addHandler(signal_h)
+    signal_log.propagate = False
+
+    # SYSTEM 日志
+    sys_log = logging.getLogger("SYSTEM")
+    sys_log.setLevel(logging.WARNING)
+    sys_h = logging.handlers.RotatingFileHandler(
+        f"{log_dir}/system.log", maxBytes=max_bytes, backupCount=backup_count, encoding="utf-8"
+    )
+    sys_h.setFormatter(fmt)
+    sys_log.addHandler(sys_h)
+    sys_log.propagate = False
+
+    return {
+        "trade": trade_log,
+        "signal": signal_log,
+        "system": sys_log
+    }
+
+# 初始化日志器
+loggers = setup_trading_logs("/root/timesfm_lab")
+log_trade = loggers["trade"].info
+log_signal = loggers["signal"].info
+log_signal_debug = loggers["signal"].debug
+log_system_warn = loggers["system"].warning
+log_system_err = loggers["system"].error
+
+# 智能路由函数：保持原有 log() 和 err() 习惯
+def log(msg):
+    if any(k in msg for k in ["✅ 开仓", "🔻 平仓", "✂️ 部分平仓", "盈利", "亏损", "保证金", "止损", "止盈"]):
+        log_trade(msg)
+    elif any(k in msg for k in ["📉 检查持仓", "触发跟踪止损", "触发初始止损", "超时", "人工平仓", "人工开仓"]):
+        log_trade(msg)
+    else:
+        log_signal(msg)
+
+def err(msg):
+    log_system_err(msg)
+
+# 兼容别名
+log_info = log
+log_error = err
 
 # ==================== 2. 核心参数 ====================
 TG_BOT_TOKEN = "8722422674:AAGrKmRurQ2G__j-Vxbh5451v0e9_u97CQY"
@@ -1088,7 +1150,8 @@ def predict_and_score(instId):
             else:
                 price_info = None
 
-        hold_minutes = estimate_hold_minutes(forecast_values, current_price, abs(best_ret), best_side)
+        dynamic_hold = estimate_hold_minutes(forecast_values, current_price, abs(best_ret), best_side)
+        hold_minutes = min(dynamic_hold, 45)   # 动态估算，最长不超过45分钟
 
         result = {
             "symbol": instId,
@@ -2032,7 +2095,7 @@ class OKXTrader:
             order_side = 'sell' if side == 'long' else 'buy'
             params = {'reduceOnly': True, 'tdMode': 'isolated'}
             if pos_mode == 'long_short_mode':
-                params['posSide'] = 'long' if side == 'long' else 'short'
+                params['posSide'] = 'long' if side == 'long' else 'short'  # 小写
             # 单边模式不传 posSide
 
             order = self.exchange.create_order(
@@ -2068,7 +2131,7 @@ class OKXTrader:
                         except:
                             pos_mode = 'long_short_mode'
                         if pos_mode == 'long_short_mode':
-                            params['posSide'] = actual_side
+                            params['posSide'] = 'long' if actual_side == 'long' else 'short'
                         self.exchange.create_order(
                             symbol=ccxt_symbol,
                             type='market',
@@ -2120,8 +2183,14 @@ class OKXTrader:
             ratio = info['open_qty'] / (info['open_qty'] + half_qty)
             info['open_margin'] *= ratio
             info['half_closed'] = True
+
+            # 部分平仓后，将剩余仓位的止损上移至成本价（保本），并收紧跟踪回撤阈值
+            info['stop_loss_price'] = info['open_price']
+            info['trailing_stop_pct'] = 1.0   # 剩余仓位更紧的跟踪止损
+            log(f"✂️ 部分平仓后，剩余仓位已设置保本止损 (止损价={info['stop_loss_price']:.6f})，跟踪回撤收紧至1%")
+
             self._save_strategy_positions()
-            push_telegram(f"✂️ 部分平仓 {ccxt_symbol} {side}\n数量: {half_qty} 张\n原因: {reason}")
+            push_telegram(f"✂️ 部分平仓 {ccxt_symbol} {side}\n数量: {half_qty} 张\n原因: {reason}\n剩余仓位已设置保本止损，跟踪阈值收紧至1%")
             return True
         except Exception as e:
             err(f"部分平仓失败: {e}")
@@ -2204,15 +2273,30 @@ class OKXTrader:
                 trough = info.get('lowest_price', info['open_price'])
                 drawdown_pct = (current_price - trough) / trough * 100 if trough > 0 else 0
 
-            trailing_pct = info.get('trailing_stop_pct', TRAILING_STOP_PCT)
+            # ========== 动态跟踪止损阈值（根据浮盈比例调整） ==========
+            pnl_abs = abs(pnl_percent)
+            if pnl_abs > 30:
+                dynamic_trail = 1.0
+            elif pnl_abs > 20:
+                dynamic_trail = 1.5
+            elif pnl_abs > 10:
+                dynamic_trail = 2.0
+            elif pnl_abs > 5:
+                dynamic_trail = 2.5
+            else:
+                dynamic_trail = TRAILING_STOP_PCT   # 默认2%
+            info['trailing_stop_pct'] = dynamic_trail
+
+            # 跟踪止损：浮盈 > 3% 自动激活
             if pnl_percent > 3.0:
                 info['trailing_activated'] = True
-            if info.get('trailing_activated', False) and drawdown_pct >= trailing_pct:
-                log(f"📉 触发跟踪止损: {sym} 回撤 {drawdown_pct:.2f}%")
+            if info.get('trailing_activated', False) and drawdown_pct >= info.get('trailing_stop_pct', TRAILING_STOP_PCT):
+                log(f"📉 触发跟踪止损: {sym} 回撤 {drawdown_pct:.2f}% (阈值{info.get('trailing_stop_pct', TRAILING_STOP_PCT)}%)")
                 self.close_position(sym, reason=f"跟踪止损回撤{drawdown_pct:.1f}%")
                 closed_any = True
                 continue
 
+            # 超时分级处理
             if hold_seconds >= expected_hold_minutes * 60:
                 if pnl_percent > 20.0 and not info.get('half_closed', False):
                     self._half_close_position(sym, reason=f"超时浮盈{pnl_percent:.1f}%减半")
@@ -2233,6 +2317,7 @@ class OKXTrader:
                     closed_any = True
                     continue
 
+            # 初始动态止损（仅当未禁用且未超过超时）
             stop_price = info.get('stop_loss_price')
             if stop_price is not None:
                 if (info['side'] == 'long' and current_price <= stop_price) or \
