@@ -60,7 +60,7 @@ log_system_exception = loggers["system"].exception
 def log(msg):
     if any(k in msg for k in ["✅ 开仓", "🔻 平仓", "盈利", "亏损", "保证金", "止损", "止盈"]):
         log_trade(msg)
-    elif any(k in msg for k in ["📉 检查持仓", "触发跟踪止损", "触发初始止损"]):
+    elif any(k in msg for k in ["📉 检查持仓", "触发跟踪止损", "触发初始止损", "趋势反转平仓"]):
         log_trade(msg)
     else:
         log_signal(msg)
@@ -136,7 +136,8 @@ ENABLE_TREND_REVERSAL = True
 ENABLE_PRICE_MOMENTUM_FILTER = True
 MOMENTUM_LIMIT_PCT = 1.5
 
-# 新闻监控已全部移除（无任何相关变量或函数）
+# 新闻监控已全部移除
+ENABLE_NEWS_MONITOR = False
 
 # ==================== 3. Telegram推送 ====================
 def push_telegram(content):
@@ -288,23 +289,9 @@ def compute_macd(series, fast=12, slow=26, signal=9):
     return macd_line.iloc[-1], signal_line.iloc[-1], histogram.iloc[-1], hist_prev
 
 def get_15min_trend(symbol):
+    """返回 (ema20, slope, is_downtrend, is_uptrend) 使用100根K线"""
     try:
-        df = fetch_klines_with_retry(symbol, HIGHER_BAR, 50)
-        if df is None or len(df) < 30:
-            return None, None
-        closes = df['c']
-        ema20 = closes.ewm(span=20, adjust=False).mean()
-        prev_ema20 = ema20.iloc[-2]
-        curr_ema20 = ema20.iloc[-1]
-        slope = (curr_ema20 - prev_ema20) / prev_ema20 if prev_ema20 != 0 else 0
-        return curr_ema20, slope
-    except Exception as e:
-        err(f"获取15分钟趋势失败 {symbol}: {e}")
-        return None, None
-
-def get_1h_trend(symbol):
-    try:
-        df = fetch_klines_with_retry(symbol, "1h", 50)
+        df = fetch_klines_with_retry(symbol, HIGHER_BAR, 100)
         if df is None or len(df) < 30:
             return None, None, False, False
         closes = df['c']
@@ -312,10 +299,26 @@ def get_1h_trend(symbol):
         prev_ema20 = ema20.iloc[-2]
         curr_ema20 = ema20.iloc[-1]
         slope = (curr_ema20 - prev_ema20) / prev_ema20 if prev_ema20 != 0 else 0
-        recent_closes = closes.iloc[-6:].values
-        below_ema_count = sum(recent_closes < ema20.iloc[-6:].values)
-        is_downtrend = (slope < -0.002) or (below_ema_count >= 4)
-        is_uptrend = (slope > 0.002) or (sum(recent_closes > ema20.iloc[-6:].values) >= 4)
+        is_downtrend = slope < -0.001
+        is_uptrend = slope > 0.001
+        return curr_ema20, slope, is_downtrend, is_uptrend
+    except Exception as e:
+        err(f"获取15分钟趋势失败 {symbol}: {e}")
+        return None, None, False, False
+
+def get_1h_trend(symbol):
+    """返回 (ema20, slope, is_downtrend, is_uptrend) 使用100根K线"""
+    try:
+        df = fetch_klines_with_retry(symbol, "1h", 100)
+        if df is None or len(df) < 30:
+            return None, None, False, False
+        closes = df['c']
+        ema20 = closes.ewm(span=20, adjust=False).mean()
+        prev_ema20 = ema20.iloc[-2]
+        curr_ema20 = ema20.iloc[-1]
+        slope = (curr_ema20 - prev_ema20) / prev_ema20 if prev_ema20 != 0 else 0
+        is_downtrend = slope < -0.001
+        is_uptrend = slope > 0.001
         return curr_ema20, slope, is_downtrend, is_uptrend
     except Exception as e:
         err(f"获取1小时趋势失败 {symbol}: {e}")
@@ -708,12 +711,6 @@ def check_volume_anomaly(symbol, current_price):
         return False, 1.0, ""
 
 def check_trend_reversal(symbol, side, current_price, ema20_15m, slope_15m):
-    """
-    检测趋势反转
-    side: 'long' 表示想要开多单，需要检测下跌趋势是否转为上涨（底部反转）
-           'short' 表示想要开空单，需要检测上涨趋势是否转为下跌（顶部反转）
-    返回 (is_reversal, reason)
-    """
     if not ENABLE_TREND_REVERSAL:
         return False, ""
     df_15m = fetch_klines_with_retry(symbol, HIGHER_BAR, 10)
@@ -733,13 +730,11 @@ def check_trend_reversal(symbol, side, current_price, ema20_15m, slope_15m):
     current_volume = volumes.iloc[-1]
     volume_surge = current_volume > avg_volume * 1.5
     
-    # 计算MACD
     macd_line, signal_line, _, _ = compute_macd(closes, MACD_FAST, MACD_SLOW, MACD_SIGNAL)
     macd_golden_cross = macd_line > signal_line and (macd_line - signal_line) > 0.0001
     macd_death_cross = macd_line < signal_line and (signal_line - macd_line) > 0.0001
     
     if side == 'long':
-        # 想要开多单：需要底部反转信号（下跌趋势末端）
         rise_from_low = (current_price - recent_low) / recent_low * 100 if recent_low > 0 else 0
         if rise_from_low > 1.5 and last_candle_bullish and volume_surge:
             return True, f"底部反转：反弹{rise_from_low:.1f}%，放量阳线"
@@ -754,7 +749,7 @@ def check_trend_reversal(symbol, side, current_price, ema20_15m, slope_15m):
         except:
             pass
         return False, "无底部反转信号"
-    else:  # side == 'short'
+    else:
         drop_from_high = (recent_high - current_price) / recent_high * 100 if recent_high > 0 else 0
         if drop_from_high > 1.5 and last_candle_bearish and volume_surge:
             return True, f"顶部反转：回落{drop_from_high:.1f}%，放量阴线"
@@ -976,11 +971,7 @@ def predict_and_score(instId):
         if best_side is None:
             return None, f"多空均未通过动态评分 (多: {long_conf:.2f}/{long_score:.1f}, 空: {short_conf:.2f}/{short_score:.1f}, diff={diff:.2f})"
 
-        # 强化技术指标与趋势过滤
-        volume_surge = vol_ratio > 2.0
-        is_reversal = False
-        rev_reason = ""
-
+        # 反转检测（改进版，不是硬性拒绝，而是结合技术指标）
         if best_side == 'long':
             if slope_15m is not None and slope_15m < -0.001:
                 is_reversal, rev_reason = check_trend_reversal(instId, 'long', current_price, ema20_15m, slope_15m)
@@ -1000,7 +991,7 @@ def predict_and_score(instId):
             if hist >= 0.0002 and not is_reversal:
                 return None, f"MACD柱状线为正({hist:.4f})，动能向上，拒绝做空"
 
-        # 趋势强制否决
+        # 趋势强制否决（原逻辑保留）
         if best_side == 'long':
             if is_1h_downtrend:
                 return None, f"1小时处于下跌趋势，禁止开多"
@@ -1012,7 +1003,8 @@ def predict_and_score(instId):
             if is_15m_uptrend and not is_reversal:
                 return None, f"15分钟处于上涨趋势且无反转，禁止开空"
 
-        # 成交异动检测（代替新闻）
+        # 新闻已全部移除，直接跳过
+        # 成交异动检测
         anomaly, vol_ratio_anom, anom_reason = check_volume_anomaly(instId, current_price)
         if anomaly:
             return None, f"成交异动拒绝: {anom_reason}"
@@ -1076,7 +1068,7 @@ def predict_and_score(instId):
                 price_info = None
 
         dynamic_hold = estimate_hold_minutes(forecast_values, current_price, abs(best_ret), best_side)
-        hold_minutes = min(dynamic_hold, 45)   # 动态估算，最长不超过45分钟
+        hold_minutes = min(dynamic_hold, 45)
 
         result = {
             "symbol": instId,
@@ -1161,7 +1153,8 @@ def run_prediction_cycle():
     df_filtered = pd.DataFrame(filtered_vol).sort_values("vol", ascending=False).head(TOP_N)
     candidates = df_filtered["symbol"].tolist()
     log(f"🎯 最终候选池（波动率Top{TOP_N}）: {len(candidates)} 个")
-    push_telegram(f"🎯 最终候选池（波动率Top{TOP_N}）: {len(candidates)} 个\n{', '.join(candidates)}")
+    # 取消冗余推送，只保留详细推送
+    # push_telegram(f"🎯 最终候选池（波动率Top{TOP_N}）: {len(candidates)} 个\n{', '.join(candidates)}")
     log("📈 开始专业评分...")
     log("-" * 80)
 
@@ -1278,8 +1271,7 @@ def run_prediction_cycle():
         json.dump({k: v[0] for k, v in output_dict.items()}, f, indent=2, ensure_ascii=False)
     return output_dict
 
-
-# ==================== 9. 异步交易类 ====================
+# ==================== 9. 异步交易类（包含反转检测和增强推送）====================
 class OKXTraderAsync:
     def __init__(self):
         self.exchange = None
@@ -1311,8 +1303,6 @@ class OKXTraderAsync:
         log("✅ 异步客户端初始化完成")
 
     async def on_mark_price(self, inst_id, mark_price):
-        """WebSocket 回调：收到标记价格后立即检查止损"""
-        # 将 instId (如 BTC-USDT-SWAP) 转换为 ccxt 符号 (BTC/USDT:USDT)
         try:
             market = self.exchange.market(inst_id)
             symbol = market['symbol']
@@ -1363,8 +1353,45 @@ class OKXTraderAsync:
             err(f"同步持仓失败: {e}")
             return {}
 
+    def _check_reversal_signal(self, symbol, side, current_price, ema20_15m, slope_15m, rsi_val, macd_hist, macd_prev):
+        """
+        检测反转信号：当 side == 'long' 且处于上涨趋势时，检查是否有顶部反转迹象。
+        当 side == 'short' 且处于下跌趋势时，检查是否有底部反转迹象。
+        返回 (is_reversal, reason)
+        """
+        is_uptrend = slope_15m > 0.001
+        is_downtrend = slope_15m < -0.001
+        if side == 'long':
+            if not is_uptrend:
+                return False, "非上涨趋势，无需检测反转"
+            reasons = []
+            if rsi_val > 70:
+                reasons.append(f"RSI={rsi_val:.1f}超买")
+            if macd_hist < 0 and macd_prev > 0:
+                reasons.append("MACD柱由正转负")
+            if ema20_15m and abs((current_price - ema20_15m)/ema20_15m) > 0.02:
+                reasons.append(f"偏离均线{((current_price-ema20_15m)/ema20_15m*100):.1f}%")
+            if len(reasons) >= 2:
+                return True, f"顶部反转信号: {', '.join(reasons)}"
+            else:
+                return False, f"未达到反转阈值 (RSI:{rsi_val:.1f}, MACD柱:{macd_hist:.4f})"
+        else:
+            if not is_downtrend:
+                return False, "非下跌趋势，无需检测反转"
+            reasons = []
+            if rsi_val < 30:
+                reasons.append(f"RSI={rsi_val:.1f}超卖")
+            if macd_hist > 0 and macd_prev < 0:
+                reasons.append("MACD柱由负转正")
+            if ema20_15m and abs((current_price - ema20_15m)/ema20_15m) > 0.02:
+                reasons.append(f"偏离均线{((ema20_15m-current_price)/ema20_15m*100):.1f}%")
+            if len(reasons) >= 2:
+                return True, f"底部反转信号: {', '.join(reasons)}"
+            else:
+                return False, f"未达到反转阈值"
+
     async def open_position(self, symbol, side, expected_return, expected_hold_minutes,
-                            ignore_price_position=False, is_with_trend=False):
+                            ignore_price_position=False, is_with_trend=False, signal_price=None):
         async with self.position_lock:
             current_pos = await self.sync_positions()
             ccxt_symbol = self.exchange.market(symbol)['symbol']
@@ -1382,7 +1409,27 @@ class OKXTraderAsync:
             ticker = await self.exchange.fetch_ticker(symbol)
             current_price = ticker['last']
 
-            # 波动率自适应（同步调用，但可接受）
+            # 获取技术指标用于反转检测
+            df_15m = fetch_klines_with_retry(symbol, HIGHER_BAR, 20)
+            if df_15m is not None and len(df_15m) >= 20:
+                closes_15m = df_15m['c']
+                rsi_val = compute_rsi(closes_15m, RSI_PERIOD)
+                _, _, macd_hist, macd_prev = compute_macd(closes_15m, MACD_FAST, MACD_SLOW, MACD_SIGNAL)
+            else:
+                rsi_val = 50
+                macd_hist = 0
+                macd_prev = 0
+
+            ema20_15m, slope_15m, _, _ = get_15min_trend(symbol)
+
+            # 反转检测拒绝
+            is_reversal, rev_reason = self._check_reversal_signal(symbol, side, current_price, ema20_15m, slope_15m, rsi_val, macd_hist, macd_prev)
+            if is_reversal:
+                log(f"⛔ 反转检测拒绝开仓 {symbol} {side.upper()}: {rev_reason}")
+                push_telegram(f"⛔ 反转检测拒单: {symbol} {side.upper()}\n{rev_reason}")
+                return False
+
+            # 波动率自适应
             df_vol = fetch_klines_with_retry(symbol, BAR, 30)
             if df_vol is not None and len(df_vol) >= 20:
                 vol_profile, atr_pct = detect_volatility_profile(df_vol)
@@ -1402,14 +1449,12 @@ class OKXTraderAsync:
             amount = self.exchange.amount_to_precision(symbol, amount)
             amount = float(amount)
 
-            # 设置杠杆
             try:
                 await self.exchange.set_leverage(LEVERAGE, symbol, params={'mgnMode': 'isolated', 'posSide': side})
             except Exception as e:
                 err(f"设置杠杆失败 {symbol}: {e}")
                 return False
 
-            # 开仓
             try:
                 order_side = 'buy' if side == 'long' else 'sell'
                 order = await self.exchange.create_order(
@@ -1429,7 +1474,6 @@ class OKXTraderAsync:
                     err(f"订单未成交: {order}")
                     return False
 
-                # ATR 止损
                 atr = self.get_atr_sync(symbol)
                 if atr is not None:
                     if side == 'long':
@@ -1461,11 +1505,21 @@ class OKXTraderAsync:
                     'half_closed': False
                 }
                 self._save_strategy_positions()
-                # 订阅 WebSocket
                 inst_id = self.exchange.market(ccxt_symbol)['id']
                 await self.ws_client.subscribe_mark_price([inst_id])
+
+                msg = (f"✅ 开仓成功\n"
+                       f"币种: {symbol}\n"
+                       f"方向: {side.upper()}\n"
+                       f"当前价格: {current_price:.6f}\n"
+                       f"开仓价: {actual_open_price:.6f}\n"
+                       f"建议开仓价: {signal_price if signal_price else actual_open_price:.6f}\n"
+                       f"止损价: {stop_loss_price:.6f}\n"
+                       f"张数: {actual_filled}\n"
+                       f"保证金: {used_margin:.2f} USDT\n"
+                       f"预期持仓: {expected_hold_minutes}分钟")
+                push_telegram(msg)
                 log(f"✅ 开仓成功 {ccxt_symbol} {side.upper()} {actual_filled} 张 @ {actual_open_price:.4f} | 止损: {stop_loss_price:.4f}")
-                push_telegram(f"✅ 开仓成功\n{symbol} {side.upper()}\n价格 {actual_open_price:.4f}\n止损 {stop_loss_price:.4f}")
                 return True
             except Exception as e:
                 err(f"开仓异常 {symbol}: {e}")
@@ -1477,6 +1531,10 @@ class OKXTraderAsync:
                 return False
             info = self.strategy_positions[symbol]
             side = info['side']
+            open_price = info['open_price']
+            open_qty = info['open_qty']
+            open_margin = info['open_margin']
+            open_time = info['open_time']
             try:
                 positions = await self.exchange.fetch_positions([symbol])
                 real_pos = None
@@ -1490,6 +1548,10 @@ class OKXTraderAsync:
                     self._save_strategy_positions()
                     return True
                 amount = abs(float(real_pos['contracts']))
+                close_price = float(real_pos.get('last', 0)) or float(real_pos.get('markPrice', 0))
+                if close_price == 0:
+                    ticker = await self.exchange.fetch_ticker(symbol)
+                    close_price = ticker['last']
                 order_side = 'sell' if side == 'long' else 'buy'
                 params = {'reduceOnly': True, 'tdMode': 'isolated', 'mgnMode': 'isolated'}
                 config = await self.exchange.public_get_account_config()
@@ -1497,10 +1559,25 @@ class OKXTraderAsync:
                 if pos_mode == 'long_short_mode':
                     params['posSide'] = side
                 order = await self.exchange.create_order(symbol, 'market', order_side, amount, params=params)
-                log(f"✅ 平仓成功 {symbol} | 原因: {reason}")
+
+                if side == 'long':
+                    pnl_usdt = (close_price - open_price) * open_qty
+                else:
+                    pnl_usdt = (open_price - close_price) * open_qty
+                pnl_pct = (pnl_usdt / open_margin) * 100 if open_margin > 0 else 0
+                hold_seconds = time.time() - open_time
+                msg = (f"🔻 平仓\n"
+                       f"币种: {symbol}\n"
+                       f"方向: {side.upper()}\n"
+                       f"开仓价: {open_price:.6f}\n"
+                       f"平仓价: {close_price:.6f}\n"
+                       f"持仓时长: {hold_seconds/60:.1f}分钟\n"
+                       f"盈亏: {pnl_usdt:+.2f} USDT ({pnl_pct:+.2f}%)\n"
+                       f"原因: {reason}")
+                push_telegram(msg)
+                log(f"✅ 平仓成功 {symbol} | 盈亏 {pnl_usdt:+.2f} | {reason}")
                 del self.strategy_positions[symbol]
                 self._save_strategy_positions()
-                push_telegram(f"🔻 平仓 {symbol}\n原因 {reason}")
                 return True
             except Exception as e:
                 err(f"平仓失败 {symbol}: {e}")
@@ -1560,12 +1637,13 @@ class OKXTraderAsync:
 
     def set_pending_signals(self, signals_list):
         self.pending_signals = []
-        for raw_symbol, side, expected_return, hold_minutes, _ in signals_list:
+        for raw_symbol, side, expected_return, hold_minutes, signal_price in signals_list:
             try:
                 market = self.exchange.market(raw_symbol)
                 ccxt_symbol = market['symbol']
-                ticker = requests.get(f"https://www.okx.com/api/v5/market/ticker?instId={raw_symbol}").json()
-                signal_price = float(ticker['data'][0]['last'])
+                if signal_price is None:
+                    ticker = requests.get(f"https://www.okx.com/api/v5/market/ticker?instId={raw_symbol}").json()
+                    signal_price = float(ticker['data'][0]['last'])
                 self.pending_signals.append({
                     'raw_symbol': raw_symbol,
                     'ccxt_symbol': ccxt_symbol,
@@ -1590,6 +1668,7 @@ class OKXTraderAsync:
             side = sig['side']
             expected_return = sig['expected_return']
             hold_min = sig['expected_hold_minutes']
+            signal_price = sig['signal_price']
             try:
                 ticker = await self.exchange.fetch_ticker(raw_symbol)
                 current_price = ticker['last']
@@ -1602,11 +1681,24 @@ class OKXTraderAsync:
                 to_remove.append(idx)
                 continue
             success = await self.open_position(raw_symbol, side, expected_return, hold_min,
-                                               ignore_price_position=True, is_with_trend=False)
+                                               ignore_price_position=True, is_with_trend=False,
+                                               signal_price=signal_price)
             if success:
                 to_remove.append(idx)
         for idx in sorted(to_remove, reverse=True):
             self.pending_signals.pop(idx)
+
+    async def check_reversal_close(self):
+        """持仓中趋势反转平仓：如果多单持仓且15m趋势转为下跌，则平仓；空单持仓且15m趋势转为上涨，则平仓"""
+        for symbol, info in list(self.strategy_positions.items()):
+            side = info['side']
+            _, _, is_downtrend, is_uptrend = get_15min_trend(symbol)
+            if side == 'long' and is_downtrend:
+                log(f"🔄 趋势反转平仓: {symbol} 多单，15m趋势已转为下跌")
+                await self.close_position(symbol, reason="趋势反转（多转空）")
+            elif side == 'short' and is_uptrend:
+                log(f"🔄 趋势反转平仓: {symbol} 空单，15m趋势已转为上涨")
+                await self.close_position(symbol, reason="趋势反转（空转多）")
 
 # ==================== 10. 异步主程序 ====================
 async def main_async():
@@ -1615,13 +1707,14 @@ async def main_async():
     last_pred = datetime.now() - timedelta(seconds=PREDICTION_INTERVAL)
     has_set_pending_this_cycle = False
 
-    log("========== 异步交易系统启动 | 杠杆3倍 | WebSocket实时止损 ==========")
-    push_telegram("🤖 异步机器人启动 (杠杆3x, WebSocket风控)")
+    log("========== 异步交易系统启动 | 杠杆3倍 | WebSocket实时止损 | 反转检测 ==========")
+    push_telegram("🤖 异步机器人启动 (杠杆3x, WebSocket风控, 反转检测)")
 
     while True:
         try:
             now = datetime.now()
             await trader.check_manual_close()
+            await trader.check_reversal_close()
             await trader.check_and_open_pending()
 
             if (now - last_pred).total_seconds() >= PREDICTION_INTERVAL:
@@ -1634,7 +1727,14 @@ async def main_async():
                     filtered = {sym: (sig, ret, hold, conf) for sym, (sig, ret, hold, conf) in signals_dict.items()
                                 if sym not in existing}
                     if filtered:
-                        signals_list = [(sym, sig, ret, hold, None) for sym, (sig, ret, hold, conf) in filtered.items()]
+                        signals_list = []
+                        for sym, (sig, ret, hold, conf) in filtered.items():
+                            try:
+                                ticker_data = requests.get(f"https://www.okx.com/api/v5/market/ticker?instId={sym}").json()
+                                sp = float(ticker_data['data'][0]['last'])
+                            except:
+                                sp = None
+                            signals_list.append((sym, sig, ret, hold, sp))
                         trader.set_pending_signals(signals_list)
                         has_set_pending_this_cycle = True
                         push_telegram(f"📋 设置 {len(signals_list)} 个待开仓信号")
