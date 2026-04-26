@@ -68,19 +68,19 @@ def log(msg):
 def err(msg):
     log_system_err(msg)
 
-# ==================== 2. 核心参数（趋势跟踪专属调整）====================
+# ==================== 2. 核心参数（趋势跟踪专属）====================
 TG_BOT_TOKEN = "8722422674:AAGrKmRurQ2G__j-Vxbh5451v0e9_u97CQY"
 TG_CHAT_ID = "5372217316"
 TG_PROXIES = None
 
-BAR = "5m"
-HIGHER_BAR = "1h"          # 趋势判断改用1小时
-LIMIT = 900
-HORIZON = 12               # 预测12根5分钟K线 = 60分钟
+BAR = "15m"                     # 趋势跟踪使用15分钟K线
+HIGHER_BAR = "1h"               # 加强判断用1小时
+LIMIT = 200                     # 200根15分钟K线（50小时）
+HORIZON = 12                    # 预测12根15分钟K线 = 3小时
 
 TOP_N = 30
 FINAL_PICK_N = 2
-TREND_FOLLOWING_RETURN = 0.012   # 顺势目标收益 1.2%
+TREND_FOLLOWING_RETURN = 0.012  # 顺势目标1.2%
 COUNTER_TREND_RETURN = 0.020
 
 MIN_R_SQUARED = 0.25
@@ -102,7 +102,7 @@ API_SECRET = "1B6A940855EC5787CD4E56BEF6D94733"
 API_PASS = "kP9!vR2@mN5+"
 IS_SANDBOX = False
 
-PREDICTION_INTERVAL = 120
+PREDICTION_INTERVAL = 120       # 每2分钟扫描一次
 MIN_BALANCE_USDT = 20.0
 
 MIN_VOLUME_USDT = 20_000_000
@@ -288,9 +288,10 @@ def compute_macd(series, fast=12, slow=26, signal=9):
     return macd_line.iloc[-1], signal_line.iloc[-1], histogram.iloc[-1], hist_prev
 
 def get_15min_trend(symbol):
+    """返回 (ema20, slope, is_downtrend, is_uptrend) 使用200根15分钟K线"""
     try:
-        df = fetch_klines_with_retry(symbol, HIGHER_BAR, 100)
-        if df is None or len(df) < 30:
+        df = fetch_klines_with_retry(symbol, BAR, 200)
+        if df is None or len(df) < 50:
             return None, None, False, False
         closes = df['c']
         ema20 = closes.ewm(span=20, adjust=False).mean()
@@ -301,10 +302,11 @@ def get_15min_trend(symbol):
         is_uptrend = slope > 0.001
         return curr_ema20, slope, is_downtrend, is_uptrend
     except Exception as e:
-        err(f"获取1小时趋势失败 {symbol}: {e}")
+        err(f"获取15分钟趋势失败 {symbol}: {e}")
         return None, None, False, False
 
 def get_1h_trend(symbol):
+    """返回 (ema20, slope, is_downtrend, is_uptrend) 使用100根1小时K线"""
     try:
         df = fetch_klines_with_retry(symbol, "1h", 100)
         if df is None or len(df) < 30:
@@ -495,13 +497,13 @@ def get_adaptive_trading_params(bar_frame, volatility_profile):
             })
     elif bar_frame == "15m":
         params.update({
-            "atr_multiplier": 1.8,
-            "stop_loss_pct": 1.2,
-            "trailing_stop_pct": 2.0
+            "atr_multiplier": 2.0,
+            "stop_loss_pct": 1.5,
+            "trailing_stop_pct": 1.0
         })
     return params
 
-# ==================== 7. 预测评分 + 多空相对评分制 ====================
+# ==================== 7. 预测评分（以15分钟趋势为主，1小时加强过滤）====================
 def get_ema20_5m(symbol):
     try:
         df = fetch_klines_with_retry(symbol, BAR, 30)
@@ -533,18 +535,26 @@ def check_weak_rally(symbol, current_price, rsi):
     except:
         return False
 
-def compute_signal_score(symbol, side, current_price, expected_return, r_squared, consistency, vol_ratio, ema20_15m, slope_15m, is_1h_downtrend=False, is_1h_uptrend=False, is_15m_downtrend=False, is_15m_uptrend=False):
+def compute_signal_score(symbol, side, current_price, expected_return, r_squared, consistency, vol_ratio, ema20_main, slope_main, is_main_downtrend, is_main_uptrend, is_1h_downtrend=False, is_1h_uptrend=False):
     base_conf = 0.7 * consistency + 0.3 * max(0.0, min(1.0, r_squared))
-    trend_factor = 1.0
+    # 趋势因子：主要基于15分钟趋势，1小时作为加强（若1小时与15分钟反向，降低因子）
     if side == 'long':
-        if is_1h_downtrend:
+        if is_main_uptrend:
+            trend_factor = 1.0
+            if is_1h_downtrend:
+                trend_factor = 0.5   # 15分钟上涨但1小时下跌，谨慎
+        elif is_main_downtrend:
             trend_factor = 0.0
-        elif is_15m_downtrend:
+        else:
             trend_factor = 0.3
-    else:
-        if is_1h_uptrend:
+    else:  # short
+        if is_main_downtrend:
+            trend_factor = 1.0
+            if is_1h_uptrend:
+                trend_factor = 0.5
+        elif is_main_uptrend:
             trend_factor = 0.0
-        elif is_15m_uptrend:
+        else:
             trend_factor = 0.3
 
     direction_confidence = base_conf * trend_factor
@@ -552,8 +562,7 @@ def compute_signal_score(symbol, side, current_price, expected_return, r_squared
         direction_confidence = min(direction_confidence, 0.6)
     base_score = abs(expected_return) * 100 * 0.4 + r_squared * 0.3 + consistency * 0.3
     base_score = min(1.0, base_score / 2.0)
-    is_with_trend = (side == 'short' and slope_15m is not None and slope_15m < -0.002) or \
-                    (side == 'long' and slope_15m is not None and slope_15m > 0.002)
+    is_with_trend = (side == 'short' and is_main_downtrend) or (side == 'long' and is_main_uptrend)
     if is_with_trend:
         final_score = min(1.0, base_score * 1.5)
     else:
@@ -627,7 +636,7 @@ def validate_signal(signal_type, symbol, current_price, rsi, adx, atr_pct, forec
     if atr_pct is not None and atr_pct > 5.0:
         return False, f"波动率过高 ({atr_pct:.2f}%)，暂停开仓"
 
-    # 趋势增强要求：ADX > 25
+    # ADX要求：趋势强度至少25
     if adx is not None and adx < 25:
         return False, f"ADX={adx:.1f} < 25，趋势强度不足"
 
@@ -644,7 +653,6 @@ def validate_signal(signal_type, symbol, current_price, rsi, adx, atr_pct, forec
             forecast_high_max = max(forecast_values[:3])
             if forecast_high_max < current_price:
                 return False, f"TimesFM预测未来最高价 {forecast_high_max:.6f} 低于当前价，上涨乏力"
-
     elif signal_type == 'SHORT':
         if rsi is not None and rsi < 35:
             return False, f"RSI={rsi:.1f} 超卖区，禁止追空"
@@ -675,9 +683,9 @@ def validate_signal(signal_type, symbol, current_price, rsi, adx, atr_pct, forec
 
 def estimate_hold_minutes(forecast_values, current_price, target_return_pct, side):
     if forecast_values is None or len(forecast_values) == 0:
-        return 60  # 趋势版本默认60分钟
+        return HORIZON * 15  # 15分钟一根K线，12根 = 180分钟
     price_seq = [current_price] + list(forecast_values[:HORIZON])
-    bar_minutes = 5
+    bar_minutes = 15
     for i in range(1, len(price_seq)):
         if side == 'long':
             ret = (price_seq[i] - current_price) / current_price
@@ -711,10 +719,10 @@ def check_volume_anomaly(symbol, current_price):
         log(f"成交异动检测异常 {symbol}: {e}")
         return False, 1.0, ""
 
-def check_trend_reversal(symbol, side, current_price, ema20_15m, slope_15m):
+def check_trend_reversal(symbol, side, current_price, ema20_main, slope_main):
     if not ENABLE_TREND_REVERSAL:
         return False, ""
-    df_15m = fetch_klines_with_retry(symbol, HIGHER_BAR, 10)
+    df_15m = fetch_klines_with_retry(symbol, BAR, 10)
     if df_15m is None or len(df_15m) < 6:
         return False, "数据不足"
     closes = df_15m['c'].astype(float)
@@ -739,7 +747,7 @@ def check_trend_reversal(symbol, side, current_price, ema20_15m, slope_15m):
         rise_from_low = (current_price - recent_low) / recent_low * 100 if recent_low > 0 else 0
         if rise_from_low > 1.5 and last_candle_bullish and volume_surge:
             return True, f"底部反转：反弹{rise_from_low:.1f}%，放量阳线"
-        if macd_golden_cross and slope_15m is not None and slope_15m > -0.0005:
+        if macd_golden_cross and slope_main is not None and slope_main > -0.0005:
             return True, f"MACD金叉，趋势转多"
         try:
             df_rsi = fetch_klines_with_retry(symbol, BAR, 20)
@@ -754,7 +762,7 @@ def check_trend_reversal(symbol, side, current_price, ema20_15m, slope_15m):
         drop_from_high = (recent_high - current_price) / recent_high * 100 if recent_high > 0 else 0
         if drop_from_high > 1.5 and last_candle_bearish and volume_surge:
             return True, f"顶部反转：回落{drop_from_high:.1f}%，放量阴线"
-        if macd_death_cross and slope_15m is not None and slope_15m < 0.0005:
+        if macd_death_cross and slope_main is not None and slope_main < 0.0005:
             return True, f"MACD死叉，趋势转空"
         try:
             df_rsi = fetch_klines_with_retry(symbol, BAR, 20)
@@ -834,13 +842,23 @@ def predict_and_score(instId):
         direction = 1 if expected_return > 0 else -1
         consistency = np.sum(np.sign(diffs) == direction) / len(diffs)
 
-        # 使用1小时趋势
+        # 获取15分钟主趋势和1小时加强趋势
+        ema20_main, slope_main, is_main_downtrend, is_main_uptrend = get_15min_trend(instId)
         ema20_1h, slope_1h, is_1h_downtrend, is_1h_uptrend = get_1h_trend(instId)
-        # 5分钟趋势（作为辅助）
-        ema20_15m, slope_15m, is_15m_downtrend, is_15m_uptrend = get_15min_trend(instId)
 
-        long_conf, long_score = compute_signal_score(instId, 'long', current_price, expected_return, r_squared, consistency, vol_ratio, ema20_1h, slope_1h, is_1h_downtrend, is_1h_uptrend, is_15m_downtrend, is_15m_uptrend)
-        short_conf, short_score = compute_signal_score(instId, 'short', current_price, -expected_return, r_squared, consistency, vol_ratio, ema20_1h, slope_1h, is_1h_downtrend, is_1h_uptrend, is_15m_downtrend, is_15m_uptrend)
+        # 如果没有15分钟趋势数据，放弃
+        if ema20_main is None:
+            return None, "无法获取15分钟趋势"
+
+        # 计算多空评分（使用主趋势和1小时加强）
+        long_conf, long_score = compute_signal_score(
+            instId, 'long', current_price, expected_return, r_squared, consistency, vol_ratio,
+            ema20_main, slope_main, is_main_downtrend, is_main_uptrend,
+            is_1h_downtrend, is_1h_uptrend)
+        short_conf, short_score = compute_signal_score(
+            instId, 'short', current_price, -expected_return, r_squared, consistency, vol_ratio,
+            ema20_main, slope_main, is_main_downtrend, is_main_uptrend,
+            is_1h_downtrend, is_1h_uptrend)
 
         adx = get_adx(instId)
         atr_pct = get_atr_percent(instId)
@@ -853,16 +871,28 @@ def predict_and_score(instId):
         ts_series = pd.Series(ts)
         macd_line, signal_line, hist, _ = compute_macd(ts_series, MACD_FAST, MACD_SLOW, MACD_SIGNAL)
 
-        # 顺势/逆势目标收益（基于1小时趋势）
-        if is_1h_uptrend:
-            min_ret_long = TREND_FOLLOWING_RETURN
-            min_ret_short = COUNTER_TREND_RETURN
-        elif is_1h_downtrend:
-            min_ret_long = COUNTER_TREND_RETURN
-            min_ret_short = TREND_FOLLOWING_RETURN
+        # 决定顺势方向：根据15分钟主趋势
+        if is_main_uptrend:
+            target_ret_long = TREND_FOLLOWING_RETURN
+            target_ret_short = COUNTER_TREND_RETURN
+            allow_long = True
+            allow_short = False
+        elif is_main_downtrend:
+            target_ret_short = TREND_FOLLOWING_RETURN
+            target_ret_long = COUNTER_TREND_RETURN
+            allow_long = False
+            allow_short = True
         else:
-            min_ret_long = TREND_FOLLOWING_RETURN
-            min_ret_short = TREND_FOLLOWING_RETURN
+            return None, f"15分钟趋势不明确: slope={slope_main:.4f}"
+
+        # 1小时加强过滤：如果1小时方向与15分钟相反，提高置信度要求
+        if allow_long and is_1h_downtrend:
+            # 15分钟上涨但1小时下跌，要求更高置信度
+            if long_conf < MIN_DIRECTION_CONFIDENCE + 0.1:
+                return None, f"15分钟上涨但1小时下跌，置信度要求提高，当前={long_conf:.2f}"
+        if allow_short and is_1h_uptrend:
+            if short_conf < MIN_DIRECTION_CONFIDENCE + 0.1:
+                return None, f"15分钟下跌但1小时上涨，置信度要求提高，当前={short_conf:.2f}"
 
         best_side = None
         best_score = 0
@@ -870,32 +900,30 @@ def predict_and_score(instId):
         best_ret = 0
         reason_detail = ""
 
-        # 简化的评分选择（只选顺势方向）
-        diff = long_score - short_score
-        if is_1h_uptrend and long_conf >= MIN_DIRECTION_CONFIDENCE and abs(expected_return) >= min_ret_long:
+        if allow_long and long_conf >= MIN_DIRECTION_CONFIDENCE and abs(expected_return) >= target_ret_long:
             best_side = 'long'
             best_score = long_score
             best_conf = long_conf
             best_ret = abs(expected_return)
-            reason_detail = f"1小时上涨趋势，多单评分领先"
-        elif is_1h_downtrend and short_conf >= MIN_DIRECTION_CONFIDENCE and abs(expected_return) >= min_ret_short:
+            reason_detail = f"15分钟上涨趋势，多单置信度{best_conf:.2f}"
+        elif allow_short and short_conf >= MIN_DIRECTION_CONFIDENCE and abs(expected_return) >= target_ret_short:
             best_side = 'short'
             best_score = short_score
             best_conf = short_conf
             best_ret = -abs(expected_return)
-            reason_detail = f"1小时下跌趋势，空单评分领先"
+            reason_detail = f"15分钟下跌趋势，空单置信度{best_conf:.2f}"
         else:
-            return None, f"趋势方向不明确或置信度不足: 1h_uptrend={is_1h_uptrend}, long_conf={long_conf:.2f}"
+            return None, f"趋势方向明确但置信度/预期收益不足: uptrend={is_main_uptrend}, long_conf={long_conf:.2f}, short_conf={short_conf:.2f}, exp_ret={expected_return:.4f}"
 
-        # 额外的价格位置过滤：顺势单要求价格在EMA20附近
+        # 额外的价格位置过滤：顺势单要求价格在EMA20附近（±2%）
         if best_side == 'long':
-            if ema20_1h is not None and current_price < ema20_1h * 0.98:
-                return None, f"价格低于1小时EMA20 2%以上，不是合适的顺势入场点"
+            if ema20_main is not None and current_price < ema20_main * 0.98:
+                return None, f"价格低于15分钟EMA20 2%以上，不是合适的顺势入场点"
             if rsi_val > 70:
                 return None, f"RSI={rsi_val:.1f}过高，追多风险大"
         else:
-            if ema20_1h is not None and current_price > ema20_1h * 1.02:
-                return None, f"价格高于1小时EMA20 2%以上，不是合适的顺势入场点"
+            if ema20_main is not None and current_price > ema20_main * 1.02:
+                return None, f"价格高于15分钟EMA20 2%以上，不是合适的顺势入场点"
             if rsi_val < 30:
                 return None, f"RSI={rsi_val:.1f}过低，追空风险大"
 
@@ -920,7 +948,7 @@ def predict_and_score(instId):
             body_bottom = min(open_p, close)
             body_len = body_top - body_bottom
             if body_len > 0:
-                is_with_trend = (best_side == 'long' and is_1h_uptrend) or (best_side == 'short' and is_1h_downtrend)
+                is_with_trend = (best_side == 'long' and is_main_uptrend) or (best_side == 'short' and is_main_downtrend)
                 if best_side == 'long':
                     if is_with_trend:
                         long_entry_max = body_top
@@ -952,7 +980,7 @@ def predict_and_score(instId):
             price_info = None
 
         dynamic_hold = estimate_hold_minutes(forecast_values, current_price, abs(best_ret), best_side)
-        hold_minutes = min(dynamic_hold, 180)  # 最长3小时
+        hold_minutes = min(dynamic_hold, 240)  # 最长4小时
 
         result = {
             "symbol": instId,
@@ -964,7 +992,7 @@ def predict_and_score(instId):
             "score": best_score,
             "last_price": current_price,
             "price_info": price_info,
-            "tech_msg": f"趋势跟踪评分: 多{long_score:.1f}/空{short_score:.1f}",
+            "tech_msg": f"15分钟趋势跟踪: 多{long_score:.1f}/空{short_score:.1f}",
             "long_score": long_score,
             "short_score": short_score,
             "adx": adx if adx else 0,
@@ -981,7 +1009,7 @@ def predict_and_score(instId):
 def run_prediction_cycle():
     now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     log(f"\n============================================================")
-    log(f"🔄 [{now_str}] {BAR}周期 | 预测{HORIZON}步（{HORIZON*5}分钟） | 每{PREDICTION_INTERVAL/60:.1f}分钟一轮")
+    log(f"🔄 [{now_str}] {BAR}周期 | 预测{HORIZON}步（{HORIZON*15}分钟） | 每{PREDICTION_INTERVAL/60:.1f}分钟一轮")
     log(f"============================================================")
 
     symbols = get_all_swap_contracts()
@@ -1152,7 +1180,7 @@ def run_prediction_cycle():
         json.dump({k: v[0] for k, v in output_dict.items()}, f, indent=2, ensure_ascii=False)
     return output_dict
 
-# ==================== 9. 异步交易类（趋势跟踪专用，继承自原异步类，但为了独立，直接完整实现）====================
+# ==================== 9. 异步交易类（趋势跟踪专用）====================
 class OKXTraderTrend:
     def __init__(self):
         self.exchange = None
@@ -1234,9 +1262,10 @@ class OKXTraderTrend:
             err(f"同步持仓失败: {e}")
             return {}
 
-    def _check_reversal_signal(self, symbol, side, current_price, ema20_1h, slope_1h, rsi_val, macd_hist, macd_prev):
-        is_uptrend = slope_1h > 0.001
-        is_downtrend = slope_1h < -0.001
+    def _check_reversal_signal(self, symbol, side, current_price, ema20_main, slope_main, rsi_val, macd_hist, macd_prev):
+        # 使用15分钟趋势检测反转
+        is_uptrend = slope_main > 0.001
+        is_downtrend = slope_main < -0.001
         if side == 'long':
             if not is_uptrend:
                 return False, "非上涨趋势，无需检测反转"
@@ -1245,12 +1274,12 @@ class OKXTraderTrend:
                 reasons.append(f"RSI={rsi_val:.1f}超买")
             if macd_hist < 0 and macd_prev > 0:
                 reasons.append("MACD柱由正转负")
-            if ema20_1h and abs((current_price - ema20_1h)/ema20_1h) > 0.03:
-                reasons.append(f"偏离均线{((current_price-ema20_1h)/ema20_1h*100):.1f}%")
+            if ema20_main and abs((current_price - ema20_main)/ema20_main) > 0.03:
+                reasons.append(f"偏离均线{((current_price-ema20_main)/ema20_main*100):.1f}%")
             if len(reasons) >= 2:
                 return True, f"顶部反转信号: {', '.join(reasons)}"
             else:
-                return False, f"未达到反转阈值 (RSI:{rsi_val:.1f}, MACD柱:{macd_hist:.4f})"
+                return False, f"未达到反转阈值"
         else:
             if not is_downtrend:
                 return False, "非下跌趋势，无需检测反转"
@@ -1259,8 +1288,8 @@ class OKXTraderTrend:
                 reasons.append(f"RSI={rsi_val:.1f}超卖")
             if macd_hist > 0 and macd_prev < 0:
                 reasons.append("MACD柱由负转正")
-            if ema20_1h and abs((current_price - ema20_1h)/ema20_1h) > 0.03:
-                reasons.append(f"偏离均线{((ema20_1h-current_price)/ema20_1h*100):.1f}%")
+            if ema20_main and abs((current_price - ema20_main)/ema20_main) > 0.03:
+                reasons.append(f"偏离均线{((ema20_main-current_price)/ema20_main*100):.1f}%")
             if len(reasons) >= 2:
                 return True, f"底部反转信号: {', '.join(reasons)}"
             else:
@@ -1285,20 +1314,20 @@ class OKXTraderTrend:
             ticker = await self.exchange.fetch_ticker(symbol)
             current_price = ticker['last']
 
-            # 获取1小时技术指标用于反转检测
-            df_1h = fetch_klines_with_retry(symbol, "1h", 20)
-            if df_1h is not None and len(df_1h) >= 20:
-                closes_1h = df_1h['c']
-                rsi_val = compute_rsi(closes_1h, RSI_PERIOD)
-                _, _, macd_hist, macd_prev = compute_macd(closes_1h, MACD_FAST, MACD_SLOW, MACD_SIGNAL)
+            # 获取15分钟技术指标用于反转检测
+            df_main = fetch_klines_with_retry(symbol, BAR, 20)
+            if df_main is not None and len(df_main) >= 20:
+                closes_main = df_main['c']
+                rsi_val = compute_rsi(closes_main, RSI_PERIOD)
+                _, _, macd_hist, macd_prev = compute_macd(closes_main, MACD_FAST, MACD_SLOW, MACD_SIGNAL)
             else:
                 rsi_val = 50
                 macd_hist = 0
                 macd_prev = 0
 
-            ema20_1h, slope_1h, _, _ = get_1h_trend(symbol)
+            ema20_main, slope_main, _, _ = get_15min_trend(symbol)
 
-            is_reversal, rev_reason = self._check_reversal_signal(symbol, side, current_price, ema20_1h, slope_1h, rsi_val, macd_hist, macd_prev)
+            is_reversal, rev_reason = self._check_reversal_signal(symbol, side, current_price, ema20_main, slope_main, rsi_val, macd_hist, macd_prev)
             if is_reversal:
                 log(f"⛔ 反转检测拒绝开仓 {symbol} {side.upper()}: {rev_reason}")
                 push_telegram(f"⛔ 反转检测拒单: {symbol} {side.upper()}\n{rev_reason}")
@@ -1566,12 +1595,12 @@ class OKXTraderTrend:
     async def check_reversal_close(self):
         for symbol, info in list(self.strategy_positions.items()):
             side = info['side']
-            _, _, is_downtrend, is_uptrend = get_1h_trend(symbol)
+            _, _, is_downtrend, is_uptrend = get_15min_trend(symbol)
             if side == 'long' and is_downtrend:
-                log(f"🔄 趋势反转平仓: {symbol} 多单，1h趋势已转为下跌")
+                log(f"🔄 趋势反转平仓: {symbol} 多单，15m趋势已转为下跌")
                 await self.close_position(symbol, reason="趋势反转（多转空）")
             elif side == 'short' and is_uptrend:
-                log(f"🔄 趋势反转平仓: {symbol} 空单，1h趋势已转为上涨")
+                log(f"🔄 趋势反转平仓: {symbol} 空单，15m趋势已转为上涨")
                 await self.close_position(symbol, reason="趋势反转（空转多）")
 
 # ==================== 10. 异步主程序 ====================
@@ -1581,8 +1610,8 @@ async def main_async():
     last_pred = datetime.now() - timedelta(seconds=PREDICTION_INTERVAL)
     has_set_pending_this_cycle = False
 
-    log("========== 趋势跟踪异步系统启动 | 杠杆3倍 | 1h趋势过滤 ==========")
-    push_telegram("📈 趋势跟踪机器人启动 (杠杆3x, 1h趋势过滤, 目标收益1.2%)")
+    log("========== 趋势跟踪异步系统启动 | 15分钟主趋势 + 1小时加强过滤 | 杠杆3倍 ==========")
+    push_telegram("📈 趋势跟踪机器人启动 (15分钟主趋势, 1小时加强, 目标收益1.2%)")
 
     while True:
         try:
