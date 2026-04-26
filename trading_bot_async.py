@@ -138,10 +138,13 @@ MOMENTUM_LIMIT_PCT = 1.5
 
 ENABLE_NEWS_MONITOR = False
 
-# 信号有效期（秒）-> 改为 60 秒
+# 信号有效期（秒）-> 60 秒
 SIGNAL_VALID_SECONDS = 60
-# 最大持仓时长（秒）-> 改为 15 分钟 = 900 秒
+# 最大持仓时长（秒）-> 15 分钟 = 900 秒
 MAX_HOLD_SECONDS = 900
+
+# ==================== 新增：自动交易开关 ====================
+AUTO_TRADE = False   # 设置为 False 时只推送信号，不执行开仓订单
 
 # ==================== 3. Telegram推送 ====================
 def push_telegram(content):
@@ -676,7 +679,7 @@ def validate_signal(signal_type, symbol, current_price, rsi, adx, atr_pct, forec
 
 def estimate_hold_minutes(forecast_values, current_price, target_return_pct, side):
     if forecast_values is None or len(forecast_values) == 0:
-        return 15  # 默认15分钟
+        return 15
     price_seq = [current_price] + list(forecast_values[:HORIZON])
     bar_minutes = 5
     for i in range(1, len(price_seq)):
@@ -914,7 +917,7 @@ def predict_and_score(instId):
                             'is_with_trend': is_with_trend
                         }
                 hold_minutes = estimate_hold_minutes(forecast_values, current_price, abs(best_ret), best_side)
-                hold_minutes = min(hold_minutes, MAX_HOLD_SECONDS/60)  # 限制最大持仓时间
+                hold_minutes = min(hold_minutes, MAX_HOLD_SECONDS/60)
                 result = {
                     "symbol": instId, "signal": best_side, "expected_return": best_ret,
                     "r_squared": r_squared, "consistency": consistency, "direction_confidence": best_conf,
@@ -1007,7 +1010,6 @@ def predict_and_score(instId):
             if is_15m_uptrend and not is_reversal:
                 return None, f"15分钟处于上涨趋势且无反转，禁止开空"
 
-        # 新闻检查已移除
         # 成交异动检测
         anomaly, vol_ratio_anom, anom_reason = check_volume_anomaly(instId, current_price)
         if anomaly:
@@ -1072,7 +1074,7 @@ def predict_and_score(instId):
                 price_info = None
 
         dynamic_hold = estimate_hold_minutes(forecast_values, current_price, abs(best_ret), best_side)
-        hold_minutes = min(dynamic_hold, MAX_HOLD_SECONDS/60)  # 限制最大持仓时间
+        hold_minutes = min(dynamic_hold, MAX_HOLD_SECONDS/60)
 
         result = {
             "symbol": instId,
@@ -1157,7 +1159,6 @@ def run_prediction_cycle():
     df_filtered = pd.DataFrame(filtered_vol).sort_values("vol", ascending=False).head(TOP_N)
     candidates = df_filtered["symbol"].tolist()
     log(f"🎯 最终候选池（波动率Top{TOP_N}）: {len(candidates)} 个")
-    # 取消冗余推送，只保留详细推送
     log("📈 开始专业评分...")
     log("-" * 80)
 
@@ -1267,6 +1268,8 @@ def run_prediction_cycle():
             msg.append("  ⚠️ 无法获取价格位置信息")
         msg.append(f"  技术确认: {tech_msg}")
         msg.append("")
+    if not AUTO_TRADE:
+        msg.append("\n⚠️ 自动交易已关闭，以上信号仅供参考，请人工判断是否开仓。")
     push_telegram("\n".join(msg))
 
     output_dict = {row['symbol']: (row['signal'], row['expected_return'], row.get('estimated_hold_minutes', 15), row['direction_confidence']) for _, row in top.iterrows()}
@@ -1419,11 +1422,37 @@ class OKXTraderAsync:
 
             ema20_15m, slope_15m, _, _ = get_15min_trend(symbol)
 
+            # 反转检测
             is_reversal, rev_reason = self._check_reversal_signal(symbol, side, current_price, ema20_15m, slope_15m, rsi_val, macd_hist, macd_prev)
             if is_reversal:
                 log(f"⛔ 反转检测拒绝开仓 {symbol} {side.upper()}: {rev_reason}")
                 push_telegram(f"⛔ 反转检测拒单: {symbol} {side.upper()}\n{rev_reason}")
                 return False
+
+            # ========= 新增：价格偏离均线和RSI极端过滤 =========
+            if ema20_15m is not None:
+                if side == 'short':
+                    deviation = (ema20_15m - current_price) / ema20_15m * 100
+                    if deviation > 1.5:
+                        log(f"⛔ 价格位置过滤: {symbol} 空单，当前价格低于EMA20 {deviation:.1f}%，拒绝追空")
+                        push_telegram(f"⛔ 价格位置过滤: {symbol} 空单，价格过低，等待反弹")
+                        return False
+                else:  # long
+                    deviation = (current_price - ema20_15m) / ema20_15m * 100
+                    if deviation > 1.5:
+                        log(f"⛔ 价格位置过滤: {symbol} 多单，当前价格高于EMA20 {deviation:.1f}%，拒绝追高")
+                        push_telegram(f"⛔ 价格位置过滤: {symbol} 多单，价格过高，等待回调")
+                        return False
+
+            if side == 'short' and rsi_val < 35:
+                log(f"⛔ RSI 过滤: {symbol} 空单，RSI={rsi_val:.1f} 超卖，拒绝追空")
+                push_telegram(f"⛔ RSI 过滤: {symbol} 空单，RSI超卖")
+                return False
+            if side == 'long' and rsi_val > 65:
+                log(f"⛔ RSI 过滤: {symbol} 多单，RSI={rsi_val:.1f} 超买，拒绝追高")
+                push_telegram(f"⛔ RSI 过滤: {symbol} 多单，RSI超买")
+                return False
+            # =================================================
 
             df_vol = fetch_klines_with_retry(symbol, BAR, 30)
             if df_vol is not None and len(df_vol) >= 20:
@@ -1656,6 +1685,15 @@ class OKXTraderAsync:
         self.pending_signals = []
 
     async def check_and_open_pending(self):
+        if not AUTO_TRADE:
+            # 自动交易关闭，不清空信号，仅记录
+            if self.pending_signals:
+                log(f"⏸️ 自动交易已关闭，跳过 {len(self.pending_signals)} 个待开仓信号")
+                # 不清空信号，下次扫描会重新生成
+                # 但为了不累积，可以清空，因为信号会由下一轮预测覆盖
+                self.pending_signals.clear()
+            return
+
         if not self.pending_signals:
             return
         to_remove = []
@@ -1775,7 +1813,7 @@ class OKXTraderAsync:
                 closed_any = True
                 continue
 
-            # 超时强制平仓（15分钟 = 900秒）
+            # 超时强制平仓
             if hold_seconds >= max_hold:
                 log(f"⏰ 持仓超时: {sym} 已持仓 {hold_seconds:.1f} 秒，强制平仓")
                 if pnl_percent > 0:
@@ -1819,7 +1857,10 @@ async def main_async():
     has_set_pending_this_cycle = False
 
     log("========== 异步交易系统启动 | 杠杆3倍 | WebSocket实时止损 | 信号60秒有效 | 持仓最长15分钟 | TimesFM模型 ==========")
-    push_telegram("🤖 机器人启动 (杠杆3x, WebSocket风控, TimesFM模型, 信号60秒有效, 持仓15分钟上限)")
+    if AUTO_TRADE:
+        push_telegram("🤖 机器人启动 (自动交易已开启)")
+    else:
+        push_telegram("🤖 机器人启动 (自动交易已关闭，仅推送信号，请人工判断开仓)")
 
     while True:
         try:
