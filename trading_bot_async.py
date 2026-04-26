@@ -84,7 +84,8 @@ TREND_FOLLOWING_RETURN = 0.003
 COUNTER_TREND_RETURN = 0.008
 
 MIN_R_SQUARED = 0.2
-MIN_DIRECTION_CONFIDENCE = 0.65
+# 方向置信度阈值调高到 0.80
+MIN_DIRECTION_CONFIDENCE = 0.80
 
 RSI_PERIOD = 7
 MACD_FAST = 5
@@ -833,10 +834,11 @@ def predict_and_score(instId):
         direction = 1 if expected_return > 0 else -1
         consistency = np.sum(np.sign(diffs) == direction) / len(diffs)
 
-        ema20_15m, slope_15m = get_15min_trend(instId)
+        # 修复：get_15min_trend 返回4个值
+        ema20_15m, slope_15m, is_15m_downtrend, is_15m_uptrend = get_15min_trend(instId)
         ema20_1h, slope_1h, is_1h_downtrend, is_1h_uptrend = get_1h_trend(instId)
-        is_15m_downtrend = slope_15m is not None and slope_15m < -0.002
-        is_15m_uptrend = slope_15m is not None and slope_15m > 0.002
+
+        # 注意：原来这里有两行重复定义 is_15m_downtrend/uptrend 的代码，已删除，因为上面已经获取到正确的值。
 
         long_conf, long_score = compute_signal_score(instId, 'long', current_price, expected_return, r_squared, consistency, vol_ratio, ema20_15m, slope_15m, is_1h_downtrend, is_1h_uptrend, is_15m_downtrend, is_15m_uptrend)
         short_conf, short_score = compute_signal_score(instId, 'short', current_price, -expected_return, r_squared, consistency, vol_ratio, ema20_15m, slope_15m, is_1h_downtrend, is_1h_uptrend, is_15m_downtrend, is_15m_uptrend)
@@ -942,13 +944,14 @@ def predict_and_score(instId):
                 best_ret = -abs(expected_return)
                 reason_detail = f"弱势反抽触发顺势补票空单 (短分{short_score:.1f} > 多分{long_score:.1f}+0.15)"
         else:
-            if diff > 0.2 and long_conf >= MIN_DIRECTION_CONFIDENCE and abs(expected_return) >= min_ret_long:
+            # 注意：这里使用了调整后的置信度阈值 0.80，且 diff 阈值提高到 0.3
+            if diff > 0.3 and long_conf >= MIN_DIRECTION_CONFIDENCE and abs(expected_return) >= min_ret_long:
                 best_side = 'long'
                 best_score = long_score
                 best_conf = long_conf
                 best_ret = abs(expected_return)
                 reason_detail = f"多空相对评分胜出 (diff={diff:.2f})"
-            elif diff < -0.2 and short_conf >= MIN_DIRECTION_CONFIDENCE and abs(expected_return) >= min_ret_short:
+            elif diff < -0.3 and short_conf >= MIN_DIRECTION_CONFIDENCE and abs(expected_return) >= min_ret_short:
                 best_side = 'short'
                 best_score = short_score
                 best_conf = short_conf
@@ -971,7 +974,7 @@ def predict_and_score(instId):
         if best_side is None:
             return None, f"多空均未通过动态评分 (多: {long_conf:.2f}/{long_score:.1f}, 空: {short_conf:.2f}/{short_score:.1f}, diff={diff:.2f})"
 
-        # 反转检测（改进版，不是硬性拒绝，而是结合技术指标）
+        # 反转检测（沿用之前的逻辑，但置信度已经调高，此处不再重复拒绝）
         if best_side == 'long':
             if slope_15m is not None and slope_15m < -0.001:
                 is_reversal, rev_reason = check_trend_reversal(instId, 'long', current_price, ema20_15m, slope_15m)
@@ -991,7 +994,7 @@ def predict_and_score(instId):
             if hist >= 0.0002 and not is_reversal:
                 return None, f"MACD柱状线为正({hist:.4f})，动能向上，拒绝做空"
 
-        # 趋势强制否决（原逻辑保留）
+        # 趋势强制否决（保留）
         if best_side == 'long':
             if is_1h_downtrend:
                 return None, f"1小时处于下跌趋势，禁止开多"
@@ -1003,7 +1006,6 @@ def predict_and_score(instId):
             if is_15m_uptrend and not is_reversal:
                 return None, f"15分钟处于上涨趋势且无反转，禁止开空"
 
-        # 新闻已全部移除，直接跳过
         # 成交异动检测
         anomaly, vol_ratio_anom, anom_reason = check_volume_anomaly(instId, current_price)
         if anomaly:
@@ -1354,11 +1356,6 @@ class OKXTraderAsync:
             return {}
 
     def _check_reversal_signal(self, symbol, side, current_price, ema20_15m, slope_15m, rsi_val, macd_hist, macd_prev):
-        """
-        检测反转信号：当 side == 'long' 且处于上涨趋势时，检查是否有顶部反转迹象。
-        当 side == 'short' 且处于下跌趋势时，检查是否有底部反转迹象。
-        返回 (is_reversal, reason)
-        """
         is_uptrend = slope_15m > 0.001
         is_downtrend = slope_15m < -0.001
         if side == 'long':
@@ -1422,7 +1419,6 @@ class OKXTraderAsync:
 
             ema20_15m, slope_15m, _, _ = get_15min_trend(symbol)
 
-            # 反转检测拒绝
             is_reversal, rev_reason = self._check_reversal_signal(symbol, side, current_price, ema20_15m, slope_15m, rsi_val, macd_hist, macd_prev)
             if is_reversal:
                 log(f"⛔ 反转检测拒绝开仓 {symbol} {side.upper()}: {rev_reason}")
@@ -1689,7 +1685,6 @@ class OKXTraderAsync:
             self.pending_signals.pop(idx)
 
     async def check_reversal_close(self):
-        """持仓中趋势反转平仓：如果多单持仓且15m趋势转为下跌，则平仓；空单持仓且15m趋势转为上涨，则平仓"""
         for symbol, info in list(self.strategy_positions.items()):
             side = info['side']
             _, _, is_downtrend, is_uptrend = get_15min_trend(symbol)
