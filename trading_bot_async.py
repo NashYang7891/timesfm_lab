@@ -84,8 +84,7 @@ TREND_FOLLOWING_RETURN = 0.003
 COUNTER_TREND_RETURN = 0.008
 
 MIN_R_SQUARED = 0.2
-# 方向置信度阈值调高到 0.80
-MIN_DIRECTION_CONFIDENCE = 0.80
+MIN_DIRECTION_CONFIDENCE = 0.80          # 调高到0.80
 
 RSI_PERIOD = 7
 MACD_FAST = 5
@@ -110,7 +109,7 @@ MIN_VOLUME_USDT = 10_000_000
 MIN_MARKET_CAP_USDT = 20_000_000
 VOLATILITY_SAMPLE_SIZE = 200
 
-LEVERAGE = 3                     # 降低杠杆至3倍
+LEVERAGE = 3
 USE_PERCENT_OF_AVAILABLE = 0.5
 MAX_CONCURRENT_POSITIONS = 3
 MAX_TOTAL_MARGIN_RATIO = 1.0
@@ -137,7 +136,6 @@ ENABLE_TREND_REVERSAL = True
 ENABLE_PRICE_MOMENTUM_FILTER = True
 MOMENTUM_LIMIT_PCT = 1.5
 
-# 新闻监控已全部移除
 ENABLE_NEWS_MONITOR = False
 
 # ==================== 3. Telegram推送 ====================
@@ -290,7 +288,6 @@ def compute_macd(series, fast=12, slow=26, signal=9):
     return macd_line.iloc[-1], signal_line.iloc[-1], histogram.iloc[-1], hist_prev
 
 def get_15min_trend(symbol):
-    """返回 (ema20, slope, is_downtrend, is_uptrend) 使用100根K线"""
     try:
         df = fetch_klines_with_retry(symbol, HIGHER_BAR, 100)
         if df is None or len(df) < 30:
@@ -308,7 +305,6 @@ def get_15min_trend(symbol):
         return None, None, False, False
 
 def get_1h_trend(symbol):
-    """返回 (ema20, slope, is_downtrend, is_uptrend) 使用100根K线"""
     try:
         df = fetch_klines_with_retry(symbol, "1h", 100)
         if df is None or len(df) < 30:
@@ -834,11 +830,8 @@ def predict_and_score(instId):
         direction = 1 if expected_return > 0 else -1
         consistency = np.sum(np.sign(diffs) == direction) / len(diffs)
 
-        # 修复：get_15min_trend 返回4个值
         ema20_15m, slope_15m, is_15m_downtrend, is_15m_uptrend = get_15min_trend(instId)
         ema20_1h, slope_1h, is_1h_downtrend, is_1h_uptrend = get_1h_trend(instId)
-
-        # 注意：原来这里有两行重复定义 is_15m_downtrend/uptrend 的代码，已删除，因为上面已经获取到正确的值。
 
         long_conf, long_score = compute_signal_score(instId, 'long', current_price, expected_return, r_squared, consistency, vol_ratio, ema20_15m, slope_15m, is_1h_downtrend, is_1h_uptrend, is_15m_downtrend, is_15m_uptrend)
         short_conf, short_score = compute_signal_score(instId, 'short', current_price, -expected_return, r_squared, consistency, vol_ratio, ema20_15m, slope_15m, is_1h_downtrend, is_1h_uptrend, is_15m_downtrend, is_15m_uptrend)
@@ -870,6 +863,7 @@ def predict_and_score(instId):
         best_ret = 0
         reason_detail = ""
 
+        # 一致性极低时强制空单扫描
         if consistency < 0.2:
             if short_score > 0.4 and abs(expected_return) >= 0.003:
                 best_side = 'short'
@@ -880,6 +874,7 @@ def predict_and_score(instId):
                 valid, reject_reason = validate_signal('SHORT', instId, current_price, rsi_val, adx, atr_pct, forecast_values)
                 if not valid:
                     return None, f"信号过滤器拦截 (SHORT): {reject_reason}"
+                # 构建price_info（略，与原逻辑相同）
                 candle = fetch_previous_candle(instId)
                 price_info = None
                 if candle:
@@ -944,7 +939,7 @@ def predict_and_score(instId):
                 best_ret = -abs(expected_return)
                 reason_detail = f"弱势反抽触发顺势补票空单 (短分{short_score:.1f} > 多分{long_score:.1f}+0.15)"
         else:
-            # 注意：这里使用了调整后的置信度阈值 0.80，且 diff 阈值提高到 0.3
+            # 提高 scoring diff 阈值到 0.3，置信度阈值 0.80
             if diff > 0.3 and long_conf >= MIN_DIRECTION_CONFIDENCE and abs(expected_return) >= min_ret_long:
                 best_side = 'long'
                 best_score = long_score
@@ -974,7 +969,9 @@ def predict_and_score(instId):
         if best_side is None:
             return None, f"多空均未通过动态评分 (多: {long_conf:.2f}/{long_score:.1f}, 空: {short_conf:.2f}/{short_score:.1f}, diff={diff:.2f})"
 
-        # 反转检测（沿用之前的逻辑，但置信度已经调高，此处不再重复拒绝）
+        # --- 技术强化过滤，修复 is_reversal 未赋值问题 ---
+        is_reversal = False
+        rev_reason = ""
         if best_side == 'long':
             if slope_15m is not None and slope_15m < -0.001:
                 is_reversal, rev_reason = check_trend_reversal(instId, 'long', current_price, ema20_15m, slope_15m)
@@ -994,7 +991,7 @@ def predict_and_score(instId):
             if hist >= 0.0002 and not is_reversal:
                 return None, f"MACD柱状线为正({hist:.4f})，动能向上，拒绝做空"
 
-        # 趋势强制否决（保留）
+        # 趋势强制否决
         if best_side == 'long':
             if is_1h_downtrend:
                 return None, f"1小时处于下跌趋势，禁止开多"
@@ -1006,6 +1003,7 @@ def predict_and_score(instId):
             if is_15m_uptrend and not is_reversal:
                 return None, f"15分钟处于上涨趋势且无反转，禁止开空"
 
+        # 新闻检查已移除
         # 成交异动检测
         anomaly, vol_ratio_anom, anom_reason = check_volume_anomaly(instId, current_price)
         if anomaly:
@@ -1155,8 +1153,7 @@ def run_prediction_cycle():
     df_filtered = pd.DataFrame(filtered_vol).sort_values("vol", ascending=False).head(TOP_N)
     candidates = df_filtered["symbol"].tolist()
     log(f"🎯 最终候选池（波动率Top{TOP_N}）: {len(candidates)} 个")
-    # 取消冗余推送，只保留详细推送
-    # push_telegram(f"🎯 最终候选池（波动率Top{TOP_N}）: {len(candidates)} 个\n{', '.join(candidates)}")
+    # 已取消冗余推送，只保留详细推送
     log("📈 开始专业评分...")
     log("-" * 80)
 
@@ -1273,7 +1270,7 @@ def run_prediction_cycle():
         json.dump({k: v[0] for k, v in output_dict.items()}, f, indent=2, ensure_ascii=False)
     return output_dict
 
-# ==================== 9. 异步交易类（包含反转检测和增强推送）====================
+# ==================== 9. 异步交易类 ====================
 class OKXTraderAsync:
     def __init__(self):
         self.exchange = None
@@ -1406,7 +1403,6 @@ class OKXTraderAsync:
             ticker = await self.exchange.fetch_ticker(symbol)
             current_price = ticker['last']
 
-            # 获取技术指标用于反转检测
             df_15m = fetch_klines_with_retry(symbol, HIGHER_BAR, 20)
             if df_15m is not None and len(df_15m) >= 20:
                 closes_15m = df_15m['c']
@@ -1425,7 +1421,6 @@ class OKXTraderAsync:
                 push_telegram(f"⛔ 反转检测拒单: {symbol} {side.upper()}\n{rev_reason}")
                 return False
 
-            # 波动率自适应
             df_vol = fetch_klines_with_retry(symbol, BAR, 30)
             if df_vol is not None and len(df_vol) >= 20:
                 vol_profile, atr_pct = detect_volatility_profile(df_vol)
