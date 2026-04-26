@@ -84,7 +84,7 @@ TREND_FOLLOWING_RETURN = 0.003
 COUNTER_TREND_RETURN = 0.008
 
 MIN_R_SQUARED = 0.2
-MIN_DIRECTION_CONFIDENCE = 0.80          # 调高到0.80
+MIN_DIRECTION_CONFIDENCE = 0.80
 
 RSI_PERIOD = 7
 MACD_FAST = 5
@@ -845,7 +845,7 @@ def predict_and_score(instId):
             rsi_val = 50
 
         ts_series = pd.Series(ts)
-        macd_line, signal_line, hist, _ = compute_macd(ts_series, MACD_FAST, MACD_SLOW, MACD_SIGNAL)
+        macd_line, signal_line, hist, hist_prev = compute_macd(ts_series, MACD_FAST, MACD_SLOW, MACD_SIGNAL)
 
         if is_15m_uptrend:
             min_ret_long = TREND_FOLLOWING_RETURN
@@ -863,7 +863,7 @@ def predict_and_score(instId):
         best_ret = 0
         reason_detail = ""
 
-        # 一致性极低时强制空单扫描
+        # 原有模型信号生成逻辑（一致性和评分差等）
         if consistency < 0.2:
             if short_score > 0.4 and abs(expected_return) >= 0.003:
                 best_side = 'short'
@@ -874,7 +874,6 @@ def predict_and_score(instId):
                 valid, reject_reason = validate_signal('SHORT', instId, current_price, rsi_val, adx, atr_pct, forecast_values)
                 if not valid:
                     return None, f"信号过滤器拦截 (SHORT): {reject_reason}"
-                # 构建price_info（略，与原逻辑相同）
                 candle = fetch_previous_candle(instId)
                 price_info = None
                 if candle:
@@ -939,7 +938,6 @@ def predict_and_score(instId):
                 best_ret = -abs(expected_return)
                 reason_detail = f"弱势反抽触发顺势补票空单 (短分{short_score:.1f} > 多分{long_score:.1f}+0.15)"
         else:
-            # 提高 scoring diff 阈值到 0.3，置信度阈值 0.80
             if diff > 0.3 and long_conf >= MIN_DIRECTION_CONFIDENCE and abs(expected_return) >= min_ret_long:
                 best_side = 'long'
                 best_score = long_score
@@ -966,10 +964,49 @@ def predict_and_score(instId):
                     best_ret = abs(expected_return)
                     reason_detail = f"顺势多单（diff={diff:.2f}不足但趋势配合）"
 
+        # ========== 新增：指标强制信号（当模型无信号时） ==========
+        if best_side is None:
+            force_long = False
+            force_short = False
+            force_reason = ""
+            # 做多条件：MACD柱 > 0.0005 且 RSI > 70 且 当前价格在EMA20上方
+            if hist > 0.0005 and rsi_val > 70 and ema20_15m is not None and current_price > ema20_15m:
+                force_long = True
+                force_reason = f"MACD柱为正({hist:.4f})，RSI超买({rsi_val:.1f})，价格在EMA20之上，强势信号"
+            # 做空条件：MACD柱 < -0.0005 且 RSI < 30 且 当前价格在EMA20下方
+            elif hist < -0.0005 and rsi_val < 30 and ema20_15m is not None and current_price < ema20_15m:
+                force_short = True
+                force_reason = f"MACD柱为负({hist:.4f})，RSI超卖({rsi_val:.1f})，价格在EMA20之下，弱势信号"
+            
+            if force_long:
+                if slope_15m is not None and slope_15m < -0.001:
+                    rev, rev_msg = check_trend_reversal(instId, 'long', current_price, ema20_15m, slope_15m)
+                    if not rev:
+                        force_long = False
+                        force_reason = f"下跌趋势无反转，放弃强制做多: {rev_msg}"
+                if force_long:
+                    best_side = 'long'
+                    best_conf = 0.8
+                    best_ret = 0.005
+                    best_score = 50.0
+                    reason_detail = f"指标强制信号: {force_reason}"
+            elif force_short:
+                if slope_15m is not None and slope_15m > 0.001:
+                    rev, rev_msg = check_trend_reversal(instId, 'short', current_price, ema20_15m, slope_15m)
+                    if not rev:
+                        force_short = False
+                        force_reason = f"上涨趋势无反转，放弃强制做空: {rev_msg}"
+                if force_short:
+                    best_side = 'short'
+                    best_conf = 0.8
+                    best_ret = -0.005
+                    best_score = 50.0
+                    reason_detail = f"指标强制信号: {force_reason}"
+
         if best_side is None:
             return None, f"多空均未通过动态评分 (多: {long_conf:.2f}/{long_score:.1f}, 空: {short_conf:.2f}/{short_score:.1f}, diff={diff:.2f})"
 
-        # --- 技术强化过滤，修复 is_reversal 未赋值问题 ---
+        # ========== 技术强化过滤（MACD/RSI否决） ==========
         is_reversal = False
         rev_reason = ""
         if best_side == 'long':
@@ -1003,7 +1040,6 @@ def predict_and_score(instId):
             if is_15m_uptrend and not is_reversal:
                 return None, f"15分钟处于上涨趋势且无反转，禁止开空"
 
-        # 新闻检查已移除
         # 成交异动检测
         anomaly, vol_ratio_anom, anom_reason = check_volume_anomaly(instId, current_price)
         if anomaly:
@@ -1153,7 +1189,6 @@ def run_prediction_cycle():
     df_filtered = pd.DataFrame(filtered_vol).sort_values("vol", ascending=False).head(TOP_N)
     candidates = df_filtered["symbol"].tolist()
     log(f"🎯 最终候选池（波动率Top{TOP_N}）: {len(candidates)} 个")
-    # 已取消冗余推送，只保留详细推送
     log("📈 开始专业评分...")
     log("-" * 80)
 
@@ -1697,8 +1732,8 @@ async def main_async():
     last_pred = datetime.now() - timedelta(seconds=PREDICTION_INTERVAL)
     has_set_pending_this_cycle = False
 
-    log("========== 异步交易系统启动 | 杠杆3倍 | WebSocket实时止损 | 反转检测 ==========")
-    push_telegram("🤖 异步机器人启动 (杠杆3x, WebSocket风控, 反转检测)")
+    log("========== 异步交易系统启动 | 杠杆3倍 | WebSocket实时止损 | 反转检测 | 指标强制信号 ==========")
+    push_telegram("🤖 异步机器人启动 (杠杆3x, WebSocket风控, 反转检测, MACD/RSI强制信号)")
 
     while True:
         try:
