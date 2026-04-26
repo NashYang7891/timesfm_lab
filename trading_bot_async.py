@@ -73,8 +73,7 @@ TG_PROXIES = None
 
 BAR = "5m"
 HIGHER_BAR = "15m"
-LIMIT = 200
-
+LIMIT = 200                     # 获取200根，但检查至少100根
 TOP_N = 50
 FINAL_PICK_N = 3
 MIN_DIRECTION_CONFIDENCE = 0.70
@@ -515,14 +514,10 @@ def compute_technical_score(symbol, current_price, df_5m):
         
         long_score = min(100, long_score)
         short_score = min(100, short_score)
-        
-        diff = abs(long_score - short_score) / 100.0
-        confidence = min(1.0, diff + 0.3)
-        
-        return long_score, short_score, confidence
+        return long_score, short_score, None
     except Exception as e:
         err(f"技术评分异常 {symbol}: {e}")
-        return 0, 0, 0.5
+        return 0, 0, None
 
 def calculate_bollinger_bands(symbol, period=20, std=2):
     try:
@@ -686,22 +681,22 @@ def check_price_momentum_filter(symbol, side, current_price):
 def predict_and_score(instId):
     try:
         df = fetch_klines_with_retry(instId, BAR, LIMIT)
-        if df is None or len(df) < 50:
-            return None, "数据不足"
+        if df is None or len(df) < 100:                     # 要求至少100根5分钟K线
+            return None, f"数据不足: 只有 {len(df) if df is not None else 0} 根K线，需要100根"
         current_price = float(df['c'].iloc[-1])
         
-        long_score, short_score, confidence = compute_technical_score(instId, current_price, df)
+        long_score, short_score, _ = compute_technical_score(instId, current_price, df)
         
-        ema20_15m, slope_15m, is_15m_downtrend, is_15m_uptrend = get_15min_trend(instId)
-        ema20_1h, slope_1h, is_1h_downtrend, is_1h_uptrend = get_1h_trend(instId)
+        _, _, is_15m_downtrend, is_15m_uptrend = get_15min_trend(instId)
+        _, _, is_1h_downtrend, is_1h_uptrend = get_1h_trend(instId)
         
         adx = get_adx(instId)
         atr_pct = get_atr_percent(instId)
         rsi_val = compute_rsi(df['c'], RSI_PERIOD)
         macd_line, signal_line, hist, hist_prev = compute_macd(df['c'], MACD_FAST, MACD_SLOW, MACD_SIGNAL)
         
+        # 确定最佳方向
         best_side = None
-        best_score = max(long_score, short_score)
         if long_score > short_score + 15:
             best_side = 'long'
         elif short_score > long_score + 15:
@@ -710,9 +705,17 @@ def predict_and_score(instId):
         if best_side is None:
             return None, f"多空评分差距不足 (多:{long_score:.1f}, 空:{short_score:.1f})"
         
-        if confidence < MIN_DIRECTION_CONFIDENCE:
-            return None, f"方向置信度不足: {confidence:.2f} < {MIN_DIRECTION_CONFIDENCE}"
+        # 计算该方向的置信度（使用分数占总分的比例）
+        total = long_score + short_score
+        if total > 0:
+            side_confidence = long_score / total if best_side == 'long' else short_score / total
+        else:
+            side_confidence = 0.5
         
+        if side_confidence < MIN_DIRECTION_CONFIDENCE:
+            return None, f"{best_side.upper()}方向置信度不足: {side_confidence:.2f} < {MIN_DIRECTION_CONFIDENCE} (多:{long_score:.1f},空:{short_score:.1f})"
+        
+        # 技术指标否决
         if best_side == 'long':
             if rsi_val > 65:
                 return None, f"RSI={rsi_val:.1f} 超买区，禁止追多"
@@ -732,6 +735,7 @@ def predict_and_score(instId):
         if not momentum_ok:
             return None, f"动量过滤: {momentum_reason}"
         
+        # 构建价格位置信息
         candle = fetch_previous_candle(instId)
         if candle:
             open_p, high, low, close = candle
@@ -771,9 +775,7 @@ def predict_and_score(instId):
         else:
             price_info = None
         
-        # 持仓时长改为 90 秒（1.5 分钟）
-        hold_minutes = 1.5
-        # 预期收益固定为 0.3%（仅用于显示）
+        hold_minutes = MAX_HOLD_SECONDS / 60.0   # 90秒 = 1.5分钟
         expected_return = 0.003 if best_side == 'long' else -0.003
         
         result = {
@@ -782,8 +784,8 @@ def predict_and_score(instId):
             "expected_return": expected_return,
             "r_squared": 0.5,
             "consistency": 0.7,
-            "direction_confidence": confidence,
-            "score": best_score,
+            "direction_confidence": side_confidence,
+            "score": max(long_score, short_score),
             "last_price": current_price,
             "price_info": price_info,
             "tech_msg": f"技术指标评分: 多{long_score:.1f}/空{short_score:.1f}，选择{best_side}",
@@ -803,7 +805,7 @@ def predict_and_score(instId):
 def run_prediction_cycle():
     now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     log(f"\n============================================================")
-    log(f"🔄 [{now_str}] {BAR}周期 | 纯技术指标信号 | 每{PREDICTION_INTERVAL/60:.1f}分钟一轮")
+    log(f"🔄 [{now_str}] {BAR}周期 | 纯技术指标信号 | 每{PREDICTION_INTERVAL/60:.1f}分钟一轮 | 要求至少100根K线")
     log(f"============================================================")
 
     symbols = get_all_swap_contracts()
@@ -877,6 +879,7 @@ def run_prediction_cycle():
         else:
             long_score = 0.0
             short_score = 0.0
+            # 尝试从拒绝原因中提取评分
             match_long = re.search(r'多:([\d.]+)', reason)
             match_short = re.search(r'空:([\d.]+)', reason)
             if match_long:
@@ -945,7 +948,7 @@ def run_prediction_cycle():
         hold_min = row.get('estimated_hold_minutes', 1.5)
         msg.append(f"#{symbol} | {signal}")
         msg.append(f"  置信度: {confidence:.2f} | 得分: {score:.4f}")
-        msg.append(f"  预估持仓时间: {hold_min} 分钟（90秒）")
+        msg.append(f"  预估持仓时间: {hold_min} 分钟（{MAX_HOLD_SECONDS}秒）")
         if price_info:
             current = price_info['current_price']
             body_bottom = price_info['body_bottom']
@@ -1178,8 +1181,6 @@ class OKXTraderAsync:
                         stop_loss_price = actual_open_price * (1 + stop_loss_pct / 100)
 
                 used_margin = actual_filled * actual_open_price / LEVERAGE
-                # 强制持仓时长为 90 秒
-                hold_seconds = MAX_HOLD_SECONDS
                 self.strategy_positions[ccxt_symbol] = {
                     'side': side,
                     'open_price': actual_open_price,
@@ -1194,7 +1195,7 @@ class OKXTraderAsync:
                     'trailing_activated': False,
                     'expected_return': expected_return,
                     'expected_met': False,
-                    'max_hold_seconds': MAX_HOLD_SECONDS,   # 记录最大持仓时间
+                    'max_hold_seconds': MAX_HOLD_SECONDS,
                     'half_closed': False
                 }
                 self._save_strategy_positions()
@@ -1344,11 +1345,11 @@ class OKXTraderAsync:
                     'signal_price': signal_price,
                     'expected_return': expected_return,
                     'expected_hold_minutes': hold_minutes,
-                    'timestamp': time.time()   # 记录信号生成时间
+                    'timestamp': time.time()
                 })
             except Exception as e:
                 err(f"获取市场信息失败 {raw_symbol}: {e}")
-        log(f"📋 设置待开仓信号: {len(self.pending_signals)} 个")
+        log(f"📋 设置待开仓信号: {len(self.pending_signals)} 个（有效期{SIGNAL_VALID_SECONDS}秒）")
 
     def clear_pending_signals(self):
         self.pending_signals = []
@@ -1359,7 +1360,6 @@ class OKXTraderAsync:
         to_remove = []
         now = time.time()
         for idx, sig in enumerate(self.pending_signals):
-            # 检查信号是否过期（30秒）
             if now - sig['timestamp'] > SIGNAL_VALID_SECONDS:
                 log(f"⏰ 信号过期: {sig['raw_symbol']} {sig['side'].upper()}，已超过 {SIGNAL_VALID_SECONDS} 秒")
                 to_remove.append(idx)
@@ -1401,7 +1401,6 @@ class OKXTraderAsync:
                 await self.close_position(symbol, reason="趋势反转（空转多）")
 
     async def check_and_close_positions(self):
-        """检查持仓的风控条件，包括超时平仓（90秒）"""
         closed_any = False
         try:
             all_positions = await self.exchange.fetch_positions()
@@ -1437,13 +1436,11 @@ class OKXTraderAsync:
                     log(f"⚠️ 无法获取 {sym} 最新价格，跳过本次检查")
                     continue
 
-            # 安全盈亏计算
             metrics = self.safe_calc_position_metrics(pos, current_price)
             if not metrics["valid"]:
                 continue
             pnl_percent = metrics["pnl_pct"]
             
-            # 更新最高/最低价（跟踪止损用）
             if info['side'] == 'long':
                 if current_price > info.get('highest_price', info['open_price']):
                     info['highest_price'] = current_price
@@ -1458,7 +1455,7 @@ class OKXTraderAsync:
             hold_seconds = time.time() - info['open_time']
             max_hold = info.get('max_hold_seconds', MAX_HOLD_SECONDS)
 
-            # 1. 初始止损
+            # 初始止损
             stop_price = info.get('stop_loss_price')
             if stop_price is not None:
                 if (info['side'] == 'long' and current_price <= stop_price) or \
@@ -1468,7 +1465,7 @@ class OKXTraderAsync:
                     closed_any = True
                     continue
 
-            # 2. 跟踪止损（浮盈>3%激活）
+            # 跟踪止损
             if pnl_percent > 3.0:
                 info['trailing_activated'] = True
             if info.get('trailing_activated', False) and drawdown_pct >= info.get('trailing_stop_pct', TRAILING_STOP_PCT):
@@ -1477,7 +1474,7 @@ class OKXTraderAsync:
                 closed_any = True
                 continue
 
-            # 3. 超时强制平仓（90秒）
+            # 超时强制平仓
             if hold_seconds >= max_hold:
                 log(f"⏰ 持仓超时: {sym} 已持仓 {hold_seconds:.1f} 秒，强制平仓")
                 if pnl_percent > 0:
@@ -1520,7 +1517,7 @@ async def main_async():
     last_pred = datetime.now() - timedelta(seconds=PREDICTION_INTERVAL)
     has_set_pending_this_cycle = False
 
-    log("========== 纯技术指标异步交易系统启动 | 杠杆3倍 | WebSocket实时止损 | 反转检测 | 信号有效期30秒 | 持仓最长90秒 ==========")
+    log("========== 纯技术指标异步交易系统启动 | 杠杆3倍 | WebSocket实时止损 | 信号30秒有效 | 持仓最多90秒 ==========")
     push_telegram("🤖 技术指标机器人启动 (杠杆3x, WebSocket风控, 无AI模型, 信号30秒有效, 持仓90秒上限)")
 
     while True:
@@ -1528,8 +1525,8 @@ async def main_async():
             now = datetime.now()
             await trader.check_manual_close()
             await trader.check_reversal_close()
-            await trader.check_and_close_positions()   # 这会处理超时平仓
-            await trader.check_and_open_pending()      # 这会检查信号有效期
+            await trader.check_and_close_positions()
+            await trader.check_and_open_pending()
 
             if (now - last_pred).total_seconds() >= PREDICTION_INTERVAL:
                 has_set_pending_this_cycle = False
