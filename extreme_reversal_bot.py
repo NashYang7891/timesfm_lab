@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-极端反转拐点推导系统 - 自动监控成交量前30的USDT永续合约
+极端反转拐点推导系统 - 自动监控成交量前30的USDT永续合约 (修正版)
 """
 
 import asyncio
@@ -90,10 +90,12 @@ class CryptoExtremeBot:
         return (norm_rsi + norm_kdj + norm_cci) / 3
 
     def calculate_momentum_pivot(self, prices):
+        """推导买入位：加速度过零后的理论拐点"""
         if len(prices) < 2:
             return None
         pivot = 2 * prices.iloc[-1] - prices.iloc[-2]
-        return round(pivot, 4)
+        # 保留足够精度，避免极低价格币种显示为 0.0
+        return round(pivot, 10)
 
     # ========== 数据获取 ==========
     async def fetch_market_data(self, symbol):
@@ -246,16 +248,18 @@ class CryptoExtremeBot:
                         if symbol in self.last_sent and now - self.last_sent[symbol] < 600:
                             continue
 
+                        # ----- 明确的多头信号模板 -----
                         msg = (
-                            f"🎯 **极端反转点位**\n\n"
+                            f"📈 **极端反转做多信号**\n\n"
                             f"🏷️ 币种: `{symbol}`\n"
                             f"💰 当前价: `{curr_price}`\n"
                             f"📍 **推导买入位**: `{target_entry}`\n\n"
-                            f"📊 **参数**:\n"
-                            f"- 偏离度: `{deviation:.2f}`\n"
-                            f"- 振荡加权: `{osc_score:.2f}`\n"
-                            f"- 挂单壁: `{buy_wall:.2f}`\n"
-                            f"⏳ 动能: `加速度过零`"
+                            f"📊 **核心参数**:\n"
+                            f"- 偏离度: `{deviation:.2f}` (超卖)\n"
+                            f"- 振荡加权: `{osc_score:.2f}` (超卖)\n"
+                            f"- 挂单壁: `{buy_wall:.2f}` (买方深度强)\n"
+                            f"⏳ 动能: `加速度过零` → 下跌衰竭\n"
+                            f"🛑 建议止损: `{curr_price * 0.98:.6f}`"
                         )
                         success = await self.send_tg(msg)
                         if success:
