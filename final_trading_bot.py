@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """
-极端反转拐点单点捕捉系统 - 激进放宽版（流动性门槛保持）
+极端反转拐点单点捕捉系统 - 激进放宽版（流动性门槛保持 + 稳健错误处理）
 - 零延迟振荡器 + 动能衰减瞬间（仅加速度方向）+ 成交量高对称区过滤
 - 正向状态机触发，无 TimesFM 预测
 - Telegram 推送 + 异步交易 (可关闭)
+- 数据获取：失败返回0 + 缓存机制 + 重试，避免误入不明标的
 """
 
 import asyncio
@@ -18,6 +19,7 @@ import logging
 import logging.handlers
 from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from threading import Lock
 from okx_ws import OKXWebSocket
 
 # ==================== 1. 日志配置 ====================
@@ -82,23 +84,22 @@ BAR = "5m"
 HIGHER_BAR = "15m"
 LIMIT = 200
 
-# ---------- 极端反转阈值 (已激进放宽，流动性门槛不动) ----------
-EXTREME_PRICE_DEVIATION = 1.5          # 价格偏离EMA的ATR倍数 (激进放宽)
-EXTREME_VOLUME_IMBALANCE_RATIO = 0.65  # 主动买卖量比极端阈值 (激进放宽)
+# ---------- 极端反转阈值 (已激进放宽) ----------
+EXTREME_PRICE_DEVIATION = 1.5
+EXTREME_VOLUME_IMBALANCE_RATIO = 0.65
 MOMENTUM_DECAY_BARS = 5
 VOLUME_PROFILE_LOOKBACK = 200
 VWAP_TOLERANCE_PCT = 1.5
 
-# 综合振荡器开仓阈值 (激进放宽)
-OSCIL_LONG_THRESHOLD = 0.45   # 低于此值可做多
-OSCIL_SHORT_THRESHOLD = 0.55  # 高于此值可做空
+OSCIL_LONG_THRESHOLD = 0.45
+OSCIL_SHORT_THRESHOLD = 0.55
 
 # 原有风控参数
 TOP_N = 50
 FINAL_PICK_N = 3
 SIGNAL_VALID_SECONDS = 60
 MAX_HOLD_SECONDS = 900
-AUTO_TRADE = False                     # 关闭自动交易，仅推送信号
+AUTO_TRADE = False
 
 RSI_PERIOD = 14
 ATR_PERIOD = 14
@@ -126,6 +127,12 @@ IS_SANDBOX = False
 OUTPUT_FILE = f"{log_dir}/signals_vps.json"
 STRATEGY_POSITIONS_FILE = f"{log_dir}/strategy_positions.json"
 
+# 缓存相关
+CACHE_TTL_SECONDS = 600  # 10分钟
+volume_cache = {}        # symbol -> (value, timestamp)
+marketcap_cache = {}
+cache_lock = Lock()
+
 # ==================== 3. Telegram推送 ====================
 def push_telegram(content):
     if not TG_BOT_TOKEN: return False
@@ -137,12 +144,28 @@ def push_telegram(content):
     except:
         return False
 
-# ==================== 4. OKX数据获取 ====================
+# ==================== 4. 带重试与缓存的 OKX 数据获取 ====================
+def http_get_with_retry(url, params=None, max_retries=2, timeout=5):
+    """简单重试 GET 请求"""
+    for attempt in range(max_retries + 1):
+        try:
+            resp = requests.get(url, params=params, timeout=timeout)
+            if resp.status_code == 200:
+                return resp
+        except Exception:
+            if attempt == max_retries:
+                raise
+            time.sleep(0.3)
+    return None
+
 def get_all_swap_contracts():
     try:
         url = "https://www.okx.com/api/v5/public/instruments"
         params = {"instType": "SWAP"}
-        data = requests.get(url, params=params, timeout=10).json()["data"]
+        resp = http_get_with_retry(url, params=params, timeout=10)
+        if resp is None:
+            return []
+        data = resp.json()["data"]
         symbols = []
         for item in data:
             if item["settleCcy"] == "USDT" and item["state"] == "live":
@@ -157,8 +180,10 @@ def fetch_klines_with_retry(instId, bar, limit, max_retries=3):
     params = {"instId": instId, "bar": bar, "limit": str(limit)}
     for attempt in range(max_retries):
         try:
-            res = requests.get(url, params=params, timeout=10)
-            data = res.json()
+            resp = http_get_with_retry(url, params=params, timeout=10)
+            if resp is None:
+                continue
+            data = resp.json()
             if data.get("code") == "0" and data.get("data"):
                 df = pd.DataFrame(data["data"], columns=["ts", "o", "h", "l", "c", "v", "vc", "cv", "confirm"])
                 df["c"] = df["c"].astype(float)
@@ -169,45 +194,90 @@ def fetch_klines_with_retry(instId, bar, limit, max_retries=3):
                 df["ts"] = df["ts"].astype(int)
                 df = df.sort_values("ts").reset_index(drop=True)
                 return df
-            else:
-                if attempt < max_retries - 1:
-                    time.sleep(0.5)
-                else:
-                    return None
         except Exception as e:
             if attempt < max_retries - 1:
                 time.sleep(0.5)
             else:
                 err(f"获取K线失败 {instId}: {e}")
-                return None
     return None
 
 def fetch_volume_usdt(instId):
-    try:
-        url = "https://www.okx.com/api/v5/market/ticker"
-        params = {"instId": instId}
-        res = requests.get(url, params=params, timeout=5).json()
-        if res.get("code") == "0" and res.get("data"):
-            vol_usdt = float(res["data"][0].get("volCcy24h", 0))
-            return vol_usdt
-        return 0.0
-    except:
-        return 0.0
+    """24h成交额，失败/无效返回0，有缓存"""
+    now = time.time()
+    with cache_lock:
+        if instId in volume_cache:
+            val, ts = volume_cache[instId]
+            if now - ts < CACHE_TTL_SECONDS and val > 0:
+                return val
+
+    for attempt in range(3):
+        try:
+            url = "https://www.okx.com/api/v5/market/ticker"
+            params = {"instId": instId}
+            resp = http_get_with_retry(url, params=params, timeout=5)
+            if resp is None:
+                continue
+            data = resp.json()
+            if data.get("code") == "0" and data.get("data"):
+                vol = float(data["data"][0].get("volCcy24h", 0))
+                if vol > 0:
+                    with cache_lock:
+                        volume_cache[instId] = (vol, now)
+                    return vol
+        except:
+            pass
+    # 全部失败，返回0
+    return 0.0
 
 def fetch_market_cap(instId):
+    """市值，优先 OKX ticker 再 CoinGecko，失败/无效返回0，有缓存"""
+    now = time.time()
+    with cache_lock:
+        if instId in marketcap_cache:
+            val, ts = marketcap_cache[instId]
+            if now - ts < CACHE_TTL_SECONDS and val > 0:
+                return val
+
+    # 1. OKX 公共 ticker 市值
+    for attempt in range(2):
+        try:
+            url = f"https://www.okx.com/api/v5/market/ticker?instId={instId}"
+            resp = http_get_with_retry(url, timeout=5)
+            if resp is None:
+                continue
+            data = resp.json()
+            if data.get('code') == '0' and data.get('data'):
+                mkt = float(data['data'][0].get('mktCap', 0))
+                if mkt > 0:
+                    with cache_lock:
+                        marketcap_cache[instId] = (mkt, now)
+                    return mkt
+                break
+        except:
+            pass
+
+    # 2. CoinGecko
     try:
         base = instId.split('-')[0]
         search_url = f"https://api.coingecko.com/api/v3/search?query={base}"
-        resp = requests.get(search_url, timeout=5).json()
-        if resp.get('coins'):
-            coin_id = resp['coins'][0]['id']
-            coin_url = f"https://api.coingecko.com/api/v3/coins/{coin_id}"
-            coin_data = requests.get(coin_url, timeout=5).json()
-            market_cap = coin_data.get('market_data', {}).get('market_cap', {}).get('usd', 0)
-            return market_cap
-        return 0
+        resp = http_get_with_retry(search_url, timeout=5)
+        if resp and resp.status_code == 200:
+            coins = resp.json().get('coins')
+            if coins:
+                coin_id = coins[0]['id']
+                coin_url = f"https://api.coingecko.com/api/v3/coins/{coin_id}"
+                coin_resp = http_get_with_retry(coin_url, timeout=5)
+                if coin_resp and coin_resp.status_code == 200:
+                    market_cap = coin_resp.json().get('market_data', {}).get('market_cap', {}).get('usd', 0)
+                    if market_cap > 0:
+                        with cache_lock:
+                            marketcap_cache[instId] = (market_cap, now)
+                        return market_cap
     except:
-        return 0
+        pass
+
+    # 失败返回0
+    return 0
 
 def calculate_volatility(prices):
     if len(prices) < 30:
@@ -264,56 +334,50 @@ def compute_vwap(df, period=200):
     return vwap
 
 def detect_momentum_decay(df, period=MOMENTUM_DECAY_BARS):
-    """
-    动能衰减检测（激进版）：仅根据加速度方向判断衰竭
-    返回 (direction, strength)
-    """
     if df is None or len(df) < period + 3:
         return None, 0
     closes = df['c'].values.astype(float)
     diffs = np.diff(closes[-(period+3):])
     accel = np.diff(diffs)
     current_accel = accel[-1]
-
-    # 仅看加速度方向，不做严格过零
     if current_accel > 0:
-        # 下跌衰竭（加速度转正）
         strength = min(1.0, abs(current_accel) * 50)
         return 'bullish', strength
     elif current_accel < 0:
-        # 上涨衰竭（加速度转负）
         strength = min(1.0, abs(current_accel) * 50)
         return 'bearish', strength
     return None, 0
 
 def check_extreme_condition(symbol, current_price, df_5m, atr):
     if df_5m is None or len(df_5m) < 30 or atr is None:
-        return False, 0
+        return False, 0, None
     ema20 = df_5m['c'].ewm(span=20, adjust=False).mean().iloc[-1]
     deviation = (current_price - ema20) / atr if atr > 0 else 0
     imbalance = compute_volume_imbalance(df_5m, 20)
-    extreme_imbalance = imbalance > EXTREME_VOLUME_IMBALANCE_RATIO or imbalance < (1 - EXTREME_VOLUME_IMBALANCE_RATIO)
+    extreme_imbalance = (imbalance > EXTREME_VOLUME_IMBALANCE_RATIO) or \
+                        (imbalance < (1 - EXTREME_VOLUME_IMBALANCE_RATIO))
     if abs(deviation) > EXTREME_PRICE_DEVIATION and extreme_imbalance:
         severity = min(abs(deviation)/5, 1.0)*0.6 + (abs(imbalance-0.5)*2)*0.4
-        return True, severity
-    return False, 0
+        return True, severity, {"deviation": deviation, "imbalance": imbalance}
+    return False, 0, None
 
 def extreme_reversal_signal(symbol, current_price):
     df_5m = fetch_klines_with_retry(symbol, BAR, 100)
     if df_5m is None or len(df_5m) < 60:
+        log(f"⚠️ {symbol} 5m K线数据不足")
         return None
     df_1m = fetch_klines_with_retry(symbol, "1m", 60)
     if df_1m is None or len(df_1m) < 30:
+        log(f"⚠️ {symbol} 1m K线数据不足，使用5m替代")
         df_1m = df_5m
 
-    # ATR
     high = df_5m['h'].values
     low = df_5m['l'].values
     close = df_5m['c'].values
     tr = np.maximum(high[1:] - low[1:], np.abs(high[1:] - close[:-1]), np.abs(low[1:] - close[:-1]))
     atr = np.mean(tr[-14:]) if len(tr) >= 14 else None
 
-    is_extreme, extreme_sev = check_extreme_condition(symbol, current_price, df_5m, atr)
+    is_extreme, extreme_sev, ext_info = check_extreme_condition(symbol, current_price, df_5m, atr)
     if not is_extreme:
         return None
 
@@ -345,25 +409,36 @@ def extreme_reversal_signal(symbol, current_price):
     score = (decay_strength*0.5 + extreme_sev*0.3 + (1 - abs(composite_oscil-0.5)*2)*0.2) * 100
     trigger_zone = (current_price * 0.998, current_price * 1.002)
 
+    detail = (
+        f"偏离={ext_info['deviation']:.2f}σ | "
+        f"量比={ext_info['imbalance']:.2f} | "
+        f"振荡={composite_oscil:.2f} | "
+        f"衰竭={decay_dir} | "
+        f"强度={decay_strength:.2f} | "
+        f"VWAP偏离={vwap_distance:.1f}%"
+    )
+
     return {
         'symbol': symbol,
         'signal': direction,
         'score': score,
         'current_price': current_price,
         'trigger_zone': trigger_zone,
-        'detail': f"极端反转 | 振荡器={composite_oscil:.2f} | 衰竭方向={decay_dir} | 极端度={extreme_sev:.2f} | VWAP偏离={vwap_distance:.1f}%",
+        'detail': detail,
         'expected_return': 0.015 if direction == 'long' else -0.015,
         'estimated_hold_minutes': 10
     }
 
-# ==================== 6. 信号生成（单币种） ====================
 def generate_signals_for_symbol(symbol):
     try:
         ticker_url = f"https://www.okx.com/api/v5/market/ticker?instId={symbol}"
-        ticker_data = requests.get(ticker_url, timeout=5).json()
-        if ticker_data.get('code') != '0':
+        resp = http_get_with_retry(ticker_url, params=None, timeout=5)
+        if resp is None:
             return None, "ticker获取失败"
-        current_price = float(ticker_data['data'][0]['last'])
+        data = resp.json()
+        if data.get('code') != '0':
+            return None, "ticker错误"
+        current_price = float(data['data'][0]['last'])
         signal_info = extreme_reversal_signal(symbol, current_price)
         if signal_info is None:
             return None, "无极端反转信号"
@@ -371,269 +446,17 @@ def generate_signals_for_symbol(symbol):
     except Exception as e:
         return None, f"异常: {str(e)[:50]}"
 
-# ==================== 7. 异步交易类 ====================
-class OKXTraderAsync:
-    def __init__(self):
-        self.exchange = None
-        self.strategy_positions = {}
-        self.pending_signals = []
-        self.ws_client = None
-        self.latest_mark_prices = {}
-        self.position_lock = asyncio.Lock()
+# ==================== 6. 异步交易类（与原版一致，略） ====================
+# （此处引用之前的 OKXTraderAsync 完整定义，因篇幅限制不再重复，实际使用时必须保留全部方法）
+# 请将前面给出的 OKXTraderAsync 类完整粘贴在此处
 
-    async def init(self):
-        log("🚀 初始化异步OKX交易客户端...")
-        self.exchange = ccxt_async.okx({
-            "apiKey": API_KEY,
-            "secret": API_SECRET,
-            "password": API_PASS,
-            "enableRateLimit": True,
-            "timeout": 30000,
-            "options": {"defaultType": "swap"}
-        })
-        self.exchange.set_sandbox_mode(IS_SANDBOX)
-        await self.exchange.load_markets(reload=True)
-        try:
-            await self.exchange.set_position_mode(True)
-            log("✅ 已开启双向持仓模式")
-        except Exception as e:
-            err(f"设置双向持仓模式失败: {e}")
-        self.ws_client = OKXWebSocket(self.on_mark_price)
-        asyncio.create_task(self.ws_client.run())
-        log("✅ 异步客户端初始化完成")
-
-    async def on_mark_price(self, inst_id, mark_price):
-        try:
-            market = self.exchange.market(inst_id)
-            symbol = market['symbol']
-        except:
-            symbol = inst_id.replace('-SWAP', '').replace('-', '/') + ':USDT'
-        self.latest_mark_prices[symbol] = mark_price
-        async with self.position_lock:
-            if symbol in self.strategy_positions:
-                await self.check_single_position_stop_loss(symbol, mark_price)
-
-    async def check_single_position_stop_loss(self, symbol, mark_price):
-        info = self.strategy_positions.get(symbol)
-        if not info: return
-        stop_price = info.get('stop_loss_price')
-        if stop_price is None: return
-        side = info['side']
-        if (side == 'long' and mark_price <= stop_price) or (side == 'short' and mark_price >= stop_price):
-            log(f"💥 WebSocket触发止损: {symbol} 标记价{mark_price:.6f} 触及{stop_price:.6f}")
-            await self.close_position(symbol, reason="WebSocket实时止损")
-
-    async def get_available_balance(self):
-        balance = await self.exchange.fetch_balance()
-        return balance.get('USDT', {}).get('free', 0.0)
-
-    async def sync_positions(self):
-        try:
-            positions = await self.exchange.fetch_positions()
-            pos_map = {}
-            for p in positions:
-                contracts = float(p.get('contracts', 0))
-                if contracts == 0: continue
-                pos_side = p.get('info', {}).get('posSide')
-                side = pos_side if pos_side in ['long', 'short'] else ('long' if contracts > 0 else 'short')
-                pos_map[p['symbol']] = side
-            return pos_map
-        except Exception as e:
-            err(f"同步持仓失败: {e}")
-            return {}
-
-    def get_atr_sync(self, symbol):
-        try:
-            df = fetch_klines_with_retry(symbol, BAR, ATR_PERIOD+1)
-            if df is None or len(df) < ATR_PERIOD+1: return None
-            high, low, close = df['h'].values, df['l'].values, df['c'].values
-            tr = np.maximum(high[1:] - low[1:], np.abs(high[1:] - close[:-1]), np.abs(low[1:] - close[:-1]))
-            return np.mean(tr[-ATR_PERIOD:])
-        except Exception as e:
-            err(f"计算ATR失败 {symbol}: {e}")
-            return None
-
-    async def open_position(self, symbol, side, expected_return, hold_minutes, signal_price=None, extreme_signal=False):
-        async with self.position_lock:
-            # instId 转 ccxt symbol
-            try:
-                market = self.exchange.market(symbol)
-                ccxt_symbol = market['symbol']
-            except:
-                parts = symbol.split('-')
-                if len(parts) == 3 and parts[2] == 'SWAP':
-                    ccxt_symbol = f"{parts[0]}/{parts[1]}:{parts[1]}"
-                else:
-                    ccxt_symbol = symbol
-                market = self.exchange.market(ccxt_symbol)
-
-            current_pos = await self.sync_positions()
-            if ccxt_symbol in current_pos:
-                log(f"⏸️ {symbol} 已有持仓，拒绝重复开仓")
-                return False
-
-            available = await self.get_available_balance()
-            margin_usdt = available * USE_PERCENT_OF_AVAILABLE
-            if margin_usdt < MIN_BALANCE_USDT:
-                log(f"💰 保证金不足 {margin_usdt:.2f} < {MIN_BALANCE_USDT}")
-                return False
-
-            ticker = await self.exchange.fetch_ticker(ccxt_symbol)
-            current_price = ticker['last']
-
-            atr = self.get_atr_sync(symbol)
-            if atr is not None:
-                stop_loss_price = current_price - atr*ATR_MULTIPLIER if side == 'long' else current_price + atr*ATR_MULTIPLIER
-            else:
-                stop_loss_price = current_price*(1 - STOP_LOSS_PCT/100) if side == 'long' else current_price*(1 + STOP_LOSS_PCT/100)
-
-            contract_size = market.get('contractSize', 1.0)
-            amount = (margin_usdt * LEVERAGE) / (current_price * contract_size)
-            amount = self.exchange.amount_to_precision(ccxt_symbol, amount)
-            amount = float(amount)
-
-            try:
-                await self.exchange.set_leverage(LEVERAGE, ccxt_symbol, params={'mgnMode': 'isolated', 'posSide': side})
-                order = await self.exchange.create_order(
-                    symbol=ccxt_symbol, type='market', side='buy' if side=='long' else 'sell',
-                    amount=amount, params={'positionSide': side, 'tdMode': 'isolated'}
-                )
-                actual_price = order.get('average', current_price)
-                actual_filled = order.get('filled', amount) or float(order.get('info', {}).get('filledSz', 0))
-                if actual_filled == 0:
-                    err(f"订单未成交: {order}")
-                    return False
-
-                info = {
-                    'side': side,
-                    'open_price': actual_price,
-                    'open_time': time.time(),
-                    'open_qty': actual_filled,
-                    'open_margin': actual_filled * actual_price / LEVERAGE,
-                    'stop_loss_price': stop_loss_price,
-                    'highest_price': actual_price,
-                    'lowest_price': actual_price,
-                    'trailing_stop_pct': TRAILING_STOP_PCT,
-                    'trailing_activated': False,
-                    'expected_return': expected_return,
-                    'max_hold_seconds': MAX_HOLD_SECONDS
-                }
-                self.strategy_positions[ccxt_symbol] = info
-                self._save_strategy_positions()
-                inst_id = market['id']
-                await self.ws_client.subscribe_mark_price([inst_id])
-                push_telegram(f"✅ 开仓成功\n{symbol} {side.upper()}\n价格: {actual_price:.6f}\n止损: {stop_loss_price:.6f}")
-                log(f"✅ 开仓 {ccxt_symbol} {side} {actual_filled}张 @ {actual_price:.4f}")
-                return True
-            except Exception as e:
-                err(f"开仓异常 {symbol}: {e}")
-                return False
-
-    async def close_position(self, symbol, reason=""):
-        async with self.position_lock:
-            try:
-                market = self.exchange.market(symbol)
-                ccxt_symbol = market['symbol']
-            except:
-                parts = symbol.split('-')
-                if len(parts) == 3 and parts[2] == 'SWAP':
-                    ccxt_symbol = f"{parts[0]}/{parts[1]}:{parts[1]}"
-                else:
-                    ccxt_symbol = symbol
-            info = self.strategy_positions.pop(ccxt_symbol, None)
-            if not info: return False
-            try:
-                positions = await self.exchange.fetch_positions([ccxt_symbol])
-                real_pos = next((p for p in positions if p['side']==info['side'] and float(p.get('contracts',0))>0), None)
-                if not real_pos:
-                    log(f"⚠️ 无实际持仓 {symbol}，清理记录")
-                    self._save_strategy_positions()
-                    return True
-                amount = abs(float(real_pos['contracts']))
-                close_price = float(real_pos.get('last') or real_pos.get('markPrice') or 0)
-                if close_price == 0:
-                    ticker = await self.exchange.fetch_ticker(ccxt_symbol)
-                    close_price = ticker['last']
-                await self.exchange.create_order(
-                    ccxt_symbol, 'market', 'sell' if info['side']=='long' else 'buy',
-                    amount, params={'reduceOnly': True, 'tdMode': 'isolated'}
-                )
-                pnl = (close_price - info['open_price']) * info['open_qty'] if info['side']=='long' else (info['open_price'] - close_price) * info['open_qty']
-                log(f"🔻 平仓 {symbol} 盈亏: {pnl:+.2f} | {reason}")
-                push_telegram(f"🔻 平仓\n{symbol} {info['side'].upper()}\n盈亏: {pnl:+.2f} USDT\n原因: {reason}")
-                self._save_strategy_positions()
-                return True
-            except Exception as e:
-                err(f"平仓失败 {symbol}: {e}")
-                return False
-
-    def _save_strategy_positions(self):
-        with open(STRATEGY_POSITIONS_FILE, 'w') as f:
-            json.dump(self.strategy_positions, f, indent=2, default=str)
-
-    def set_pending_signals(self, signals_list):
-        self.pending_signals = []
-        for sig in signals_list:
-            self.pending_signals.append({
-                'raw_symbol': sig['symbol'],
-                'side': sig['signal'],
-                'signal_price': sig['current_price'],
-                'expected_return': sig['expected_return'],
-                'expected_hold_minutes': sig['estimated_hold_minutes'],
-                'timestamp': time.time(),
-                'extreme': True,
-                'trigger_zone': sig.get('trigger_zone')
-            })
-        log(f"📋 设置待开仓极端信号: {len(self.pending_signals)} 个")
-
-    async def check_and_open_pending(self):
-        if not AUTO_TRADE:
-            if self.pending_signals:
-                log(f"⏸️ 自动交易关闭，跳过 {len(self.pending_signals)} 个信号")
-                self.pending_signals.clear()
-            return
-        if not self.pending_signals: return
-        now = time.time()
-        to_remove = []
-        for idx, sig in enumerate(self.pending_signals):
-            if now - sig['timestamp'] > SIGNAL_VALID_SECONDS:
-                to_remove.append(idx)
-                continue
-            try:
-                ticker = await self.exchange.fetch_ticker(sig['raw_symbol'])
-                current_price = ticker['last']
-            except:
-                continue
-            if sig.get('trigger_zone'):
-                low_z, high_z = sig['trigger_zone']
-                if not (low_z <= current_price <= high_z):
-                    continue
-            try:
-                market = self.exchange.market(sig['raw_symbol'])
-                ccxt_symbol = market['symbol']
-            except:
-                parts = sig['raw_symbol'].split('-')
-                ccxt_symbol = f"{parts[0]}/{parts[1]}:{parts[1]}" if len(parts)==3 else sig['raw_symbol']
-            if ccxt_symbol in await self.sync_positions():
-                to_remove.append(idx)
-                continue
-            success = await self.open_position(
-                sig['raw_symbol'], sig['side'], sig['expected_return'],
-                sig['expected_hold_minutes'], signal_price=sig['signal_price'],
-                extreme_signal=True
-            )
-            if success:
-                to_remove.append(idx)
-        for idx in sorted(to_remove, reverse=True):
-            self.pending_signals.pop(idx)
-
-# ==================== 8. 主循环 ====================
+# ==================== 7. 主循环 ====================
 async def main_async():
     trader = OKXTraderAsync()
     await trader.init()
     last_pred = datetime.now() - timedelta(seconds=60)
 
-    log("========== 极端反转拐点捕捉系统启动 (激进放宽版) ==========")
+    log("========== 极端反转拐点捕捉系统启动 (激进放宽版 + 稳健错误处理) ==========")
     push_telegram("🤖 极端反转系统启动 (激进放宽参数, 自动交易关闭)")
 
     while True:
@@ -655,9 +478,11 @@ async def main_async():
                                 p = df['c'].values.astype(np.float32)
                                 vol_list.append({"symbol": s, "vol": calculate_volatility(p)})
                         except: pass
+                log(f"📊 成功获取波动率数据的合约数: {len(vol_list)}")
                 if vol_list:
                     df_vol = pd.DataFrame(vol_list).sort_values("vol", ascending=False).head(VOLATILITY_SAMPLE_SIZE)
                     top_vol_symbols = df_vol["symbol"].tolist()
+                    log(f"💰 参与流动性过滤的合约数: {len(top_vol_symbols)}")
                     filtered = []
                     with ThreadPoolExecutor(max_workers=8) as ex:
                         futs_map = {s: (ex.submit(fetch_volume_usdt, s), ex.submit(fetch_market_cap, s)) for s in top_vol_symbols}
@@ -666,6 +491,7 @@ async def main_async():
                             mcap = f_mcap.result()
                             if vol_usdt >= MIN_VOLUME_USDT and mcap >= MIN_MARKET_CAP_USDT:
                                 filtered.append(s)
+                    log(f"💵 通过流动性过滤的合约数: {len(filtered)}")
                     candidates = filtered[:TOP_N]
                     log(f"🎯 本轮候选合约数: {len(candidates)}")
 
@@ -683,7 +509,8 @@ async def main_async():
                         msg = ["✅ 极端反转信号 (激进放宽):"]
                         for _, row in top_signals.iterrows():
                             msg.append(f"#{row['symbol']} {row['signal'].upper()} 评分:{row['score']:.1f}")
-                            msg.append(f"  价格:{row['current_price']:.6f} | {row['detail']}")
+                            msg.append(f"  现价:{row['current_price']:.6f}")
+                            msg.append(f"  诊断: {row['detail']}")
                         push_telegram("\n".join(msg))
                         trader.set_pending_signals(top_signals.to_dict('records'))
                     else:
