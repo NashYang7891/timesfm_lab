@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-极端反转拐点单点捕捉系统 - 激进放宽版
-- 零延迟振荡器 + 动能衰减瞬间（仅加速度过零）+ 成交量高对称区过滤
+极端反转拐点单点捕捉系统 - 激进放宽版（流动性门槛保持）
+- 零延迟振荡器 + 动能衰减瞬间（仅加速度方向）+ 成交量高对称区过滤
 - 正向状态机触发，无 TimesFM 预测
 - Telegram 推送 + 异步交易 (可关闭)
 """
@@ -16,7 +16,6 @@ import time
 import os
 import logging
 import logging.handlers
-import re
 from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from okx_ws import OKXWebSocket
@@ -74,7 +73,7 @@ def log(msg):
 def err(msg):
     log_system_err(msg)
 
-# ==================== 2. 核心参数（已激进放宽） ====================
+# ==================== 2. 核心参数 ====================
 TG_BOT_TOKEN = "8722422674:AAGrKmRurQ2G__j-Vxbh5451v0e9_u97CQY"
 TG_CHAT_ID = "5372217316"
 TG_PROXIES = None
@@ -83,12 +82,16 @@ BAR = "5m"
 HIGHER_BAR = "15m"
 LIMIT = 200
 
-# ---------- 极端反转阈值 (已放宽) ----------
-EXTREME_PRICE_DEVIATION = 2.0          # 偏离EMA的ATR倍数 (原3.0)
-EXTREME_VOLUME_IMBALANCE_RATIO = 0.70  # 主动买卖量比极端阈值 (原0.75)
-MOMENTUM_DECAY_BARS = 5                # 动能衰减检测窗口(1m K线)
+# ---------- 极端反转阈值 (已激进放宽，流动性门槛不动) ----------
+EXTREME_PRICE_DEVIATION = 1.5          # 价格偏离EMA的ATR倍数 (激进放宽)
+EXTREME_VOLUME_IMBALANCE_RATIO = 0.65  # 主动买卖量比极端阈值 (激进放宽)
+MOMENTUM_DECAY_BARS = 5
 VOLUME_PROFILE_LOOKBACK = 200
 VWAP_TOLERANCE_PCT = 1.5
+
+# 综合振荡器开仓阈值 (激进放宽)
+OSCIL_LONG_THRESHOLD = 0.45   # 低于此值可做多
+OSCIL_SHORT_THRESHOLD = 0.55  # 高于此值可做空
 
 # 原有风控参数
 TOP_N = 50
@@ -103,6 +106,7 @@ ATR_MULTIPLIER = 2.0
 TRAILING_STOP_PCT = 2.0
 STOP_LOSS_PCT = 1.5
 
+# 流动性门槛（保持不变）
 MIN_VOLUME_USDT = 10_000_000
 MIN_MARKET_CAP_USDT = 20_000_000
 VOLATILITY_SAMPLE_SIZE = 200
@@ -221,7 +225,6 @@ def compute_rsi(series, period=14):
     return rsi.iloc[-1] if not rsi.empty else 50
 
 def compute_efficiency_ratio(prices, period=10):
-    """高效价格动量比：净变化/路径长度"""
     if len(prices) < period + 1:
         return 0.5
     direction = abs(prices[-1] - prices[-period-1])
@@ -231,7 +234,6 @@ def compute_efficiency_ratio(prices, period=10):
     return direction / volatility
 
 def compute_simple_phase(prices, period=20):
-    """简化瞬时相位角（0-1），0超卖，1超买"""
     if len(prices) < period + 3:
         return 0.5
     window = prices[-period:]
@@ -243,7 +245,6 @@ def compute_simple_phase(prices, period=20):
     return np.clip(phase_norm, 0, 1)
 
 def compute_volume_imbalance(df, period=20):
-    """主动买卖量比：阳线成交量占比"""
     if df is None or len(df) < period:
         return 0.5
     recent = df.iloc[-period:]
@@ -255,7 +256,6 @@ def compute_volume_imbalance(df, period=20):
     return buy_vol / total
 
 def compute_vwap(df, period=200):
-    """滚动VWAP"""
     if df is None or len(df) < period:
         return None
     recent = df.iloc[-period:].copy()
@@ -265,40 +265,33 @@ def compute_vwap(df, period=200):
 
 def detect_momentum_decay(df, period=MOMENTUM_DECAY_BARS):
     """
-    动能衰减检测：仅用加速度过零（激进放宽）
+    动能衰减检测（激进版）：仅根据加速度方向判断衰竭
     返回 (direction, strength)
-      direction: 'bullish' (下跌衰竭,做多), 'bearish' (上涨衰竭,做空), None
     """
     if df is None or len(df) < period + 3:
         return None, 0
     closes = df['c'].values.astype(float)
-    
-    # 价格加速度（二阶差分）
     diffs = np.diff(closes[-(period+3):])
     accel = np.diff(diffs)
     current_accel = accel[-1]
-    prev_accel = accel[-2] if len(accel) >= 2 else 0
-    
-    # 仅依据加速度过零
-    if current_accel > 0 and prev_accel <= 0:
-        # 下跌衰竭（加速度由负转正）
+
+    # 仅看加速度方向，不做严格过零
+    if current_accel > 0:
+        # 下跌衰竭（加速度转正）
         strength = min(1.0, abs(current_accel) * 50)
         return 'bullish', strength
-    elif current_accel < 0 and prev_accel >= 0:
-        # 上涨衰竭（加速度由正转负）
+    elif current_accel < 0:
+        # 上涨衰竭（加速度转负）
         strength = min(1.0, abs(current_accel) * 50)
         return 'bearish', strength
-    
     return None, 0
 
 def check_extreme_condition(symbol, current_price, df_5m, atr):
-    """极端形态双确检测"""
     if df_5m is None or len(df_5m) < 30 or atr is None:
         return False, 0
     ema20 = df_5m['c'].ewm(span=20, adjust=False).mean().iloc[-1]
     deviation = (current_price - ema20) / atr if atr > 0 else 0
     imbalance = compute_volume_imbalance(df_5m, 20)
-    # 极端失衡：>0.70 或 <0.30
     extreme_imbalance = imbalance > EXTREME_VOLUME_IMBALANCE_RATIO or imbalance < (1 - EXTREME_VOLUME_IMBALANCE_RATIO)
     if abs(deviation) > EXTREME_PRICE_DEVIATION and extreme_imbalance:
         severity = min(abs(deviation)/5, 1.0)*0.6 + (abs(imbalance-0.5)*2)*0.4
@@ -306,61 +299,52 @@ def check_extreme_condition(symbol, current_price, df_5m, atr):
     return False, 0
 
 def extreme_reversal_signal(symbol, current_price):
-    """
-    极端拐点综合判定（激进放宽版）
-    返回 dict 或 None
-    """
     df_5m = fetch_klines_with_retry(symbol, BAR, 100)
     if df_5m is None or len(df_5m) < 60:
         return None
     df_1m = fetch_klines_with_retry(symbol, "1m", 60)
     if df_1m is None or len(df_1m) < 30:
-        df_1m = df_5m  # 降级使用
-    
+        df_1m = df_5m
+
     # ATR
     high = df_5m['h'].values
     low = df_5m['l'].values
     close = df_5m['c'].values
     tr = np.maximum(high[1:] - low[1:], np.abs(high[1:] - close[:-1]), np.abs(low[1:] - close[:-1]))
     atr = np.mean(tr[-14:]) if len(tr) >= 14 else None
-    
-    # 极端形态
+
     is_extreme, extreme_sev = check_extreme_condition(symbol, current_price, df_5m, atr)
     if not is_extreme:
         return None
-    
-    # 多振荡器加权
+
     efficiency = compute_efficiency_ratio(df_5m['c'].values, 10)
     phase = compute_simple_phase(df_5m['c'].values, 20)
     rsi_val = compute_rsi(df_5m['c'], RSI_PERIOD)
     composite_oscil = 0.4*efficiency + 0.3*phase + 0.3*(rsi_val/100)
-    
-    # 动能衰减（仅加速度过零）
+
     decay_dir, decay_strength = detect_momentum_decay(df_1m)
     if decay_dir is None:
         return None
-    
-    # VWAP过滤
+
     vwap = compute_vwap(df_5m, VOLUME_PROFILE_LOOKBACK)
     vwap_distance = 0
     if vwap is not None:
         vwap_distance = abs(current_price - vwap) / vwap * 100
         if vwap_distance > VWAP_TOLERANCE_PCT:
-            decay_strength *= 0.6  # 偏离高成交量区削弱信号
-    
-    # 方向判定（阈值已放宽）
+            decay_strength *= 0.6
+
     direction = None
-    if decay_dir == 'bullish' and composite_oscil < 0.40:   # 原0.30
+    if decay_dir == 'bullish' and composite_oscil < OSCIL_LONG_THRESHOLD:
         direction = 'long'
-    elif decay_dir == 'bearish' and composite_oscil > 0.60: # 原0.70
+    elif decay_dir == 'bearish' and composite_oscil > OSCIL_SHORT_THRESHOLD:
         direction = 'short'
-    
+
     if direction is None:
         return None
-    
+
     score = (decay_strength*0.5 + extreme_sev*0.3 + (1 - abs(composite_oscil-0.5)*2)*0.2) * 100
     trigger_zone = (current_price * 0.998, current_price * 1.002)
-    
+
     return {
         'symbol': symbol,
         'signal': direction,
@@ -372,16 +356,14 @@ def extreme_reversal_signal(symbol, current_price):
         'estimated_hold_minutes': 10
     }
 
-# ==================== 6. 信号生成（无TimesFM） ====================
+# ==================== 6. 信号生成（单币种） ====================
 def generate_signals_for_symbol(symbol):
-    """为单个合约生成极端反转信号"""
     try:
         ticker_url = f"https://www.okx.com/api/v5/market/ticker?instId={symbol}"
         ticker_data = requests.get(ticker_url, timeout=5).json()
         if ticker_data.get('code') != '0':
             return None, "ticker获取失败"
         current_price = float(ticker_data['data'][0]['last'])
-        
         signal_info = extreme_reversal_signal(symbol, current_price)
         if signal_info is None:
             return None, "无极端反转信号"
@@ -473,12 +455,11 @@ class OKXTraderAsync:
 
     async def open_position(self, symbol, side, expected_return, hold_minutes, signal_price=None, extreme_signal=False):
         async with self.position_lock:
-            # 将 instId 转换为 ccxt 格式
+            # instId 转 ccxt symbol
             try:
                 market = self.exchange.market(symbol)
                 ccxt_symbol = market['symbol']
-            except Exception:
-                # 如果直接找不到，尝试转换格式
+            except:
                 parts = symbol.split('-')
                 if len(parts) == 3 and parts[2] == 'SWAP':
                     ccxt_symbol = f"{parts[0]}/{parts[1]}:{parts[1]}"
@@ -497,11 +478,10 @@ class OKXTraderAsync:
                 log(f"💰 保证金不足 {margin_usdt:.2f} < {MIN_BALANCE_USDT}")
                 return False
 
-            ticker = await self.exchange.fetch_ticker(ccxt_symbol)  # 使用 ccxt symbol
+            ticker = await self.exchange.fetch_ticker(ccxt_symbol)
             current_price = ticker['last']
 
-            # 止损
-            atr = self.get_atr_sync(symbol)  # 仍使用原始 instId 获取K线
+            atr = self.get_atr_sync(symbol)
             if atr is not None:
                 stop_loss_price = current_price - atr*ATR_MULTIPLIER if side == 'long' else current_price + atr*ATR_MULTIPLIER
             else:
@@ -551,7 +531,6 @@ class OKXTraderAsync:
 
     async def close_position(self, symbol, reason=""):
         async with self.position_lock:
-            # 尝试转换格式
             try:
                 market = self.exchange.market(symbol)
                 ccxt_symbol = market['symbol']
@@ -620,7 +599,6 @@ class OKXTraderAsync:
             if now - sig['timestamp'] > SIGNAL_VALID_SECONDS:
                 to_remove.append(idx)
                 continue
-            # 正向状态机：价格在触发区内立即开仓
             try:
                 ticker = await self.exchange.fetch_ticker(sig['raw_symbol'])
                 current_price = ticker['last']
@@ -630,7 +608,6 @@ class OKXTraderAsync:
                 low_z, high_z = sig['trigger_zone']
                 if not (low_z <= current_price <= high_z):
                     continue
-            # 避免重复持仓
             try:
                 market = self.exchange.market(sig['raw_symbol'])
                 ccxt_symbol = market['symbol']
@@ -665,6 +642,7 @@ async def main_async():
             await trader.check_and_open_pending()
 
             if (now - last_pred).total_seconds() >= 60:
+                log("🔄 开始新一轮市场扫描...")
                 symbols = get_all_swap_contracts()
                 vol_list = []
                 with ThreadPoolExecutor(max_workers=8) as ex:
@@ -689,6 +667,7 @@ async def main_async():
                             if vol_usdt >= MIN_VOLUME_USDT and mcap >= MIN_MARKET_CAP_USDT:
                                 filtered.append(s)
                     candidates = filtered[:TOP_N]
+                    log(f"🎯 本轮候选合约数: {len(candidates)}")
 
                     signals = []
                     with ThreadPoolExecutor(max_workers=8) as ex:
@@ -708,7 +687,6 @@ async def main_async():
                         push_telegram("\n".join(msg))
                         trader.set_pending_signals(top_signals.to_dict('records'))
                     else:
-                        # 不推送无信号，避免刷屏（可自行决定）
                         log("📉 本轮无极端反转信号")
                 last_pred = now
 
