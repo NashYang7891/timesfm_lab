@@ -422,7 +422,7 @@ class OKXTraderAsync:
             "options": {"defaultType": "swap"}
         })
         self.exchange.set_sandbox_mode(IS_SANDBOX)
-        await self.exchange.load_markets()
+        await self.exchange.load_markets(reload=True)
         try:
             await self.exchange.set_position_mode(True)
             log("✅ 已开启双向持仓模式")
