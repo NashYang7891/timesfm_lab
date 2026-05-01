@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-极端反转拐点单点捕捉系统 (最优实践版)
-- 零延迟振荡器 + 动能衰减瞬间 + 成交量高对称区过滤
-- 正向状态机触发，不使用 TimesFM 预测
+极端反转拐点单点捕捉系统 - 激进放宽版
+- 零延迟振荡器 + 动能衰减瞬间（仅加速度过零）+ 成交量高对称区过滤
+- 正向状态机触发，无 TimesFM 预测
 - Telegram 推送 + 异步交易 (可关闭)
 """
 
@@ -19,7 +19,7 @@ import logging.handlers
 import re
 from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from okx_ws import OKXWebSocket      # 自定义WebSocket客户端, 需自行实现
+from okx_ws import OKXWebSocket
 
 # ==================== 1. 日志配置 ====================
 def setup_trading_logs(log_dir="/root/timesfm_lab", max_bytes=10*1024*1024, backup_count=5):
@@ -74,22 +74,21 @@ def log(msg):
 def err(msg):
     log_system_err(msg)
 
-# ==================== 2. 核心参数 ====================
+# ==================== 2. 核心参数（已激进放宽） ====================
 TG_BOT_TOKEN = "8722422674:AAGrKmRurQ2G__j-Vxbh5451v0e9_u97CQY"
 TG_CHAT_ID = "5372217316"
 TG_PROXIES = None
 
 BAR = "5m"
 HIGHER_BAR = "15m"
-LIMIT = 200                    # 用于指标计算的K线数量
+LIMIT = 200
 
-# 极端反转策略权重参数
-EXTREME_PRICE_DEVIATION = 3.0          # 价格偏离EMA的ATR倍数阈值
-EXTREME_VOLUME_IMBALANCE_RATIO = 0.75  # 主动买卖量比极端阈值(>0.75或<0.25)
+# ---------- 极端反转阈值 (已放宽) ----------
+EXTREME_PRICE_DEVIATION = 2.0          # 偏离EMA的ATR倍数 (原3.0)
+EXTREME_VOLUME_IMBALANCE_RATIO = 0.70  # 主动买卖量比极端阈值 (原0.75)
 MOMENTUM_DECAY_BARS = 5                # 动能衰减检测窗口(1m K线)
-MOMENTUM_ACCEL_THRESHOLD = 0.0005      # 加速度过零阈值
-VOLUME_PROFILE_LOOKBACK = 200          # VWAP计算K线数
-VWAP_TOLERANCE_PCT = 1.5               # 价格在VWAP附近的容忍度(%)
+VOLUME_PROFILE_LOOKBACK = 200
+VWAP_TOLERANCE_PCT = 1.5
 
 # 原有风控参数
 TOP_N = 50
@@ -222,7 +221,7 @@ def compute_rsi(series, period=14):
     return rsi.iloc[-1] if not rsi.empty else 50
 
 def compute_efficiency_ratio(prices, period=10):
-    """高效价格动量比：净变化/路径长度，越接近1趋势越强"""
+    """高效价格动量比：净变化/路径长度"""
     if len(prices) < period + 1:
         return 0.5
     direction = abs(prices[-1] - prices[-period-1])
@@ -266,14 +265,13 @@ def compute_vwap(df, period=200):
 
 def detect_momentum_decay(df, period=MOMENTUM_DECAY_BARS):
     """
-    动能衰减检测：加速度过零 + 量价背离
+    动能衰减检测：仅用加速度过零（激进放宽）
     返回 (direction, strength)
-      direction: 'bullish' (下跌衰竭), 'bearish' (上涨衰竭), None
+      direction: 'bullish' (下跌衰竭,做多), 'bearish' (上涨衰竭,做空), None
     """
     if df is None or len(df) < period + 3:
         return None, 0
     closes = df['c'].values.astype(float)
-    volumes = df['v'].values.astype(float)
     
     # 价格加速度（二阶差分）
     diffs = np.diff(closes[-(period+3):])
@@ -281,25 +279,14 @@ def detect_momentum_decay(df, period=MOMENTUM_DECAY_BARS):
     current_accel = accel[-1]
     prev_accel = accel[-2] if len(accel) >= 2 else 0
     
-    # 近期最低/最高量价
-    seg_closes = closes[-(period+1):-1]
-    seg_volumes = volumes[-(period+1):-1]
-    low_idx = np.argmin(seg_closes)
-    high_idx = np.argmax(seg_closes)
-    vol_at_low = seg_volumes[low_idx]
-    vol_at_high = seg_volumes[high_idx]
-    current_vol = volumes[-1]
-    
-    # 下跌衰竭（做多信号）
-    if (current_accel > 0 and prev_accel <= 0) or \
-       (closes[-1] <= closes[-2] and current_vol < vol_at_low * 0.7):
-        strength = min(1.0, abs(current_accel)*100 + (1 - current_vol/max(vol_at_low,1)))
+    # 仅依据加速度过零
+    if current_accel > 0 and prev_accel <= 0:
+        # 下跌衰竭（加速度由负转正）
+        strength = min(1.0, abs(current_accel) * 50)
         return 'bullish', strength
-    
-    # 上涨衰竭（做空信号）
-    if (current_accel < 0 and prev_accel >= 0) or \
-       (closes[-1] >= closes[-2] and current_vol < vol_at_high * 0.7):
-        strength = min(1.0, abs(current_accel)*100 + (1 - current_vol/max(vol_at_high,1)))
+    elif current_accel < 0 and prev_accel >= 0:
+        # 上涨衰竭（加速度由正转负）
+        strength = min(1.0, abs(current_accel) * 50)
         return 'bearish', strength
     
     return None, 0
@@ -311,6 +298,7 @@ def check_extreme_condition(symbol, current_price, df_5m, atr):
     ema20 = df_5m['c'].ewm(span=20, adjust=False).mean().iloc[-1]
     deviation = (current_price - ema20) / atr if atr > 0 else 0
     imbalance = compute_volume_imbalance(df_5m, 20)
+    # 极端失衡：>0.70 或 <0.30
     extreme_imbalance = imbalance > EXTREME_VOLUME_IMBALANCE_RATIO or imbalance < (1 - EXTREME_VOLUME_IMBALANCE_RATIO)
     if abs(deviation) > EXTREME_PRICE_DEVIATION and extreme_imbalance:
         severity = min(abs(deviation)/5, 1.0)*0.6 + (abs(imbalance-0.5)*2)*0.4
@@ -319,7 +307,7 @@ def check_extreme_condition(symbol, current_price, df_5m, atr):
 
 def extreme_reversal_signal(symbol, current_price):
     """
-    极端拐点综合判定（最优实践正向推导）
+    极端拐点综合判定（激进放宽版）
     返回 dict 或 None
     """
     df_5m = fetch_klines_with_retry(symbol, BAR, 100)
@@ -347,7 +335,7 @@ def extreme_reversal_signal(symbol, current_price):
     rsi_val = compute_rsi(df_5m['c'], RSI_PERIOD)
     composite_oscil = 0.4*efficiency + 0.3*phase + 0.3*(rsi_val/100)
     
-    # 动能衰减
+    # 动能衰减（仅加速度过零）
     decay_dir, decay_strength = detect_momentum_decay(df_1m)
     if decay_dir is None:
         return None
@@ -360,11 +348,11 @@ def extreme_reversal_signal(symbol, current_price):
         if vwap_distance > VWAP_TOLERANCE_PCT:
             decay_strength *= 0.6  # 偏离高成交量区削弱信号
     
-    # 方向判定
+    # 方向判定（阈值已放宽）
     direction = None
-    if decay_dir == 'bullish' and composite_oscil < 0.3:
+    if decay_dir == 'bullish' and composite_oscil < 0.40:   # 原0.30
         direction = 'long'
-    elif decay_dir == 'bearish' and composite_oscil > 0.7:
+    elif decay_dir == 'bearish' and composite_oscil > 0.60: # 原0.70
         direction = 'short'
     
     if direction is None:
@@ -401,7 +389,7 @@ def generate_signals_for_symbol(symbol):
     except Exception as e:
         return None, f"异常: {str(e)[:50]}"
 
-# ==================== 7. 异步交易类（保留原有风控，增加极端信号处理） ====================
+# ==================== 7. 异步交易类 ====================
 class OKXTraderAsync:
     def __init__(self):
         self.exchange = None
@@ -485,36 +473,49 @@ class OKXTraderAsync:
 
     async def open_position(self, symbol, side, expected_return, hold_minutes, signal_price=None, extreme_signal=False):
         async with self.position_lock:
+            # 将 instId 转换为 ccxt 格式
+            try:
+                market = self.exchange.market(symbol)
+                ccxt_symbol = market['symbol']
+            except Exception:
+                # 如果直接找不到，尝试转换格式
+                parts = symbol.split('-')
+                if len(parts) == 3 and parts[2] == 'SWAP':
+                    ccxt_symbol = f"{parts[0]}/{parts[1]}:{parts[1]}"
+                else:
+                    ccxt_symbol = symbol
+                market = self.exchange.market(ccxt_symbol)
+
             current_pos = await self.sync_positions()
-            ccxt_symbol = self.exchange.market(symbol)['symbol']
             if ccxt_symbol in current_pos:
                 log(f"⏸️ {symbol} 已有持仓，拒绝重复开仓")
                 return False
+
             available = await self.get_available_balance()
             margin_usdt = available * USE_PERCENT_OF_AVAILABLE
             if margin_usdt < MIN_BALANCE_USDT:
                 log(f"💰 保证金不足 {margin_usdt:.2f} < {MIN_BALANCE_USDT}")
                 return False
-            ticker = await self.exchange.fetch_ticker(symbol)
+
+            ticker = await self.exchange.fetch_ticker(ccxt_symbol)  # 使用 ccxt symbol
             current_price = ticker['last']
 
-            # 极端信号可跳过一些位置过滤，此处简化保留
-            atr = self.get_atr_sync(symbol)
+            # 止损
+            atr = self.get_atr_sync(symbol)  # 仍使用原始 instId 获取K线
             if atr is not None:
                 stop_loss_price = current_price - atr*ATR_MULTIPLIER if side == 'long' else current_price + atr*ATR_MULTIPLIER
             else:
                 stop_loss_price = current_price*(1 - STOP_LOSS_PCT/100) if side == 'long' else current_price*(1 + STOP_LOSS_PCT/100)
 
-            market = self.exchange.market(symbol)
             contract_size = market.get('contractSize', 1.0)
             amount = (margin_usdt * LEVERAGE) / (current_price * contract_size)
-            amount = self.exchange.amount_to_precision(symbol, amount)
+            amount = self.exchange.amount_to_precision(ccxt_symbol, amount)
             amount = float(amount)
 
             try:
-                await self.exchange.set_leverage(LEVERAGE, symbol, params={'mgnMode': 'isolated', 'posSide': side})
+                await self.exchange.set_leverage(LEVERAGE, ccxt_symbol, params={'mgnMode': 'isolated', 'posSide': side})
                 order = await self.exchange.create_order(
-                    symbol=symbol, type='market', side='buy' if side=='long' else 'sell',
+                    symbol=ccxt_symbol, type='market', side='buy' if side=='long' else 'sell',
                     amount=amount, params={'positionSide': side, 'tdMode': 'isolated'}
                 )
                 actual_price = order.get('average', current_price)
@@ -539,7 +540,7 @@ class OKXTraderAsync:
                 }
                 self.strategy_positions[ccxt_symbol] = info
                 self._save_strategy_positions()
-                inst_id = self.exchange.market(ccxt_symbol)['id']
+                inst_id = market['id']
                 await self.ws_client.subscribe_mark_price([inst_id])
                 push_telegram(f"✅ 开仓成功\n{symbol} {side.upper()}\n价格: {actual_price:.6f}\n止损: {stop_loss_price:.6f}")
                 log(f"✅ 开仓 {ccxt_symbol} {side} {actual_filled}张 @ {actual_price:.4f}")
@@ -549,23 +550,33 @@ class OKXTraderAsync:
                 return False
 
     async def close_position(self, symbol, reason=""):
-        # ... 保留原有平仓实现，此处简化
         async with self.position_lock:
-            info = self.strategy_positions.pop(symbol, None)
+            # 尝试转换格式
+            try:
+                market = self.exchange.market(symbol)
+                ccxt_symbol = market['symbol']
+            except:
+                parts = symbol.split('-')
+                if len(parts) == 3 and parts[2] == 'SWAP':
+                    ccxt_symbol = f"{parts[0]}/{parts[1]}:{parts[1]}"
+                else:
+                    ccxt_symbol = symbol
+            info = self.strategy_positions.pop(ccxt_symbol, None)
             if not info: return False
             try:
-                positions = await self.exchange.fetch_positions([symbol])
+                positions = await self.exchange.fetch_positions([ccxt_symbol])
                 real_pos = next((p for p in positions if p['side']==info['side'] and float(p.get('contracts',0))>0), None)
                 if not real_pos:
                     log(f"⚠️ 无实际持仓 {symbol}，清理记录")
+                    self._save_strategy_positions()
                     return True
                 amount = abs(float(real_pos['contracts']))
                 close_price = float(real_pos.get('last') or real_pos.get('markPrice') or 0)
                 if close_price == 0:
-                    ticker = await self.exchange.fetch_ticker(symbol)
+                    ticker = await self.exchange.fetch_ticker(ccxt_symbol)
                     close_price = ticker['last']
                 await self.exchange.create_order(
-                    symbol, 'market', 'sell' if info['side']=='long' else 'buy',
+                    ccxt_symbol, 'market', 'sell' if info['side']=='long' else 'buy',
                     amount, params={'reduceOnly': True, 'tdMode': 'isolated'}
                 )
                 pnl = (close_price - info['open_price']) * info['open_qty'] if info['side']=='long' else (info['open_price'] - close_price) * info['open_qty']
@@ -609,17 +620,23 @@ class OKXTraderAsync:
             if now - sig['timestamp'] > SIGNAL_VALID_SECONDS:
                 to_remove.append(idx)
                 continue
+            # 正向状态机：价格在触发区内立即开仓
             try:
                 ticker = await self.exchange.fetch_ticker(sig['raw_symbol'])
                 current_price = ticker['last']
             except:
                 continue
-            # 正向状态机：价格在触发区内立即开仓
             if sig.get('trigger_zone'):
                 low_z, high_z = sig['trigger_zone']
                 if not (low_z <= current_price <= high_z):
                     continue
-            ccxt_symbol = self.exchange.market(sig['raw_symbol'])['symbol']
+            # 避免重复持仓
+            try:
+                market = self.exchange.market(sig['raw_symbol'])
+                ccxt_symbol = market['symbol']
+            except:
+                parts = sig['raw_symbol'].split('-')
+                ccxt_symbol = f"{parts[0]}/{parts[1]}:{parts[1]}" if len(parts)==3 else sig['raw_symbol']
             if ccxt_symbol in await self.sync_positions():
                 to_remove.append(idx)
                 continue
@@ -639,17 +656,15 @@ async def main_async():
     await trader.init()
     last_pred = datetime.now() - timedelta(seconds=60)
 
-    log("========== 极端反转拐点捕捉系统启动 | 杠杆3x | 仅推送信号 ==========")
-    push_telegram("🤖 极端反转系统启动 (自动交易关闭)")
+    log("========== 极端反转拐点捕捉系统启动 (激进放宽版) ==========")
+    push_telegram("🤖 极端反转系统启动 (激进放宽参数, 自动交易关闭)")
 
     while True:
         try:
             now = datetime.now()
             await trader.check_and_open_pending()
-            # 可加入定期持仓检查等
 
             if (now - last_pred).total_seconds() >= 60:
-                # 获取高波动候选
                 symbols = get_all_swap_contracts()
                 vol_list = []
                 with ThreadPoolExecutor(max_workers=8) as ex:
@@ -665,7 +680,6 @@ async def main_async():
                 if vol_list:
                     df_vol = pd.DataFrame(vol_list).sort_values("vol", ascending=False).head(VOLATILITY_SAMPLE_SIZE)
                     top_vol_symbols = df_vol["symbol"].tolist()
-                    # 过滤成交额/市值
                     filtered = []
                     with ThreadPoolExecutor(max_workers=8) as ex:
                         futs_map = {s: (ex.submit(fetch_volume_usdt, s), ex.submit(fetch_market_cap, s)) for s in top_vol_symbols}
@@ -687,15 +701,17 @@ async def main_async():
                     if signals:
                         df_sig = pd.DataFrame(signals).sort_values("score", ascending=False)
                         top_signals = df_sig.head(FINAL_PICK_N)
-                        msg = ["✅ 极端反转信号:"]
+                        msg = ["✅ 极端反转信号 (激进放宽):"]
                         for _, row in top_signals.iterrows():
                             msg.append(f"#{row['symbol']} {row['signal'].upper()} 评分:{row['score']:.1f}")
                             msg.append(f"  价格:{row['current_price']:.6f} | {row['detail']}")
                         push_telegram("\n".join(msg))
                         trader.set_pending_signals(top_signals.to_dict('records'))
                     else:
-                        push_telegram("📉 无极端反转信号")
+                        # 不推送无信号，避免刷屏（可自行决定）
+                        log("📉 本轮无极端反转信号")
                 last_pred = now
+
             await asyncio.sleep(1)
         except KeyboardInterrupt:
             log("🛑 停止")
