@@ -165,29 +165,50 @@ class CryptoExtremeBot:
 
     # ========== 动态获取热门合约 ==========
     async def fetch_hot_symbols(self):
-        """拉取全部 USDT 永续合约，按 24h 成交量排序保留前 N"""
+        """通过 OKX 公共 API 获取成交量最大的 top_n_symbols 个 SWAP 合约"""
         try:
-            markets = self.exchange.markets
-            swap_ids = []
-            for mkt_id, mkt in markets.items():
-                if mkt.get('swap') and mkt.get('quote') == 'USDT' and mkt.get('active'):
-                    inst_id = mkt.get('id')  # 如 "BTC-USDT-SWAP"
-                    if inst_id and inst_id.endswith('-SWAP'):
-                        swap_ids.append(inst_id)
+            # 1. 获取所有 USDT 永续合约的 instId 列表
+            instruments_url = "https://www.okx.com/api/v5/public/instruments"
+            params = {"instType": "SWAP"}
+            async with httpx.AsyncClient() as client:
+                resp = await client.get(instruments_url, params=params, timeout=10)
+                if resp.status_code != 200:
+                    raise Exception(f"HTTP {resp.status_code}")
+                data = resp.json()
+                if data.get("code") != "0":
+                    raise Exception(f"API error: {data}")
 
-            # 批量获取 tickers 以拿到成交量
-            tickers = await self.exchange.fetch_tickers()
-            vol_list = []
-            for inst_id in swap_ids:
-                ticker = tickers.get(inst_id)
-                if ticker:
-                    vol = ticker.get('quoteVolume') or 0
-                    vol_list.append((inst_id, vol))
-            vol_list.sort(key=lambda x: x[1], reverse=True)
-            self.symbols = [s for s, _ in vol_list[:self.top_n_symbols]]
+            all_inst_ids = [item["instId"] for item in data["data"]
+                            if item["settleCcy"] == "USDT" and item["state"] == "live"]
+
+            # 2. 批量获取合约的 24h 成交量（USDT 计价）
+            tickers_url = "https://www.okx.com/api/v5/market/tickers"
+            params = {"instType": "SWAP"}
+            async with httpx.AsyncClient() as client:
+                resp = await client.get(tickers_url, params=params, timeout=10)
+                if resp.status_code != 200:
+                    raise Exception(f"HTTP {resp.status_code}")
+                tickers_data = resp.json()
+                if tickers_data.get("code") != "0":
+                    raise Exception(f"Tickers API error: {tickers_data}")
+
+            # 构建 instId -> volCcy24h 的字典
+            vol_map = {}
+            for t in tickers_data["data"]:
+                inst_id = t.get("instId")
+                if inst_id:
+                    vol = float(t.get("volCcy24h", 0))
+                    vol_map[inst_id] = vol
+
+            # 3. 筛选并排序前 top_n_symbols 个
+            valid_pairs = [(inst_id, vol_map.get(inst_id, 0)) for inst_id in all_inst_ids]
+            valid_pairs.sort(key=lambda x: x[1], reverse=True)
+            self.symbols = [s for s, _ in valid_pairs[:self.top_n_symbols]]
+
             print(f"✅ 动态热门合约: {len(self.symbols)} 个，示例: {self.symbols[:6]}")
         except Exception as e:
             print(f"⚠️ 获取热门合约失败，使用默认列表: {e}")
+            # 兜底列表
             self.symbols = [
                 "BTC-USDT-SWAP", "ETH-USDT-SWAP", "SOL-USDT-SWAP",
                 "XRP-USDT-SWAP", "DOGE-USDT-SWAP", "ADA-USDT-SWAP",
