@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
-极端反转拐点推导系统 - 稳健版 + 时段过滤器 + 流动性强化
+极端反转拐点推导系统 - 黄金平衡版
+参数优化 + 分层过滤 + 时段风控 + 成交量门槛 20M
 """
 
 import asyncio
@@ -23,24 +24,23 @@ OKX_PASSPHRASE = "kP9!vR2@mN5+"
 
 class CryptoExtremeBot:
     def __init__(self):
-        # ---------- 策略参数（稳健版）----------
-        self.deviation_std = 2.8           # 偏离度基准阈值
-        self.threshold_osc = 0.2           # 综合振荡器阈值（<0.2极度超卖）
-        self.wall_threshold = 0.75         # 挂单壁比例
-        self.volume_spike_ratio = 2.0      # 成交量倍数
-        self.accel_threshold = 0.001       # 加速度缓冲垫
-        self.min_15m_rsi = 35              # 15分钟RSI必须<35
+        # ---------- 黄金平衡版参数 ----------
+        self.deviation_std = 2.5           # 偏离度：从2.8降至2.5，兼顾极端与频率
+        self.threshold_osc = 0.28          # 综合振荡器：从0.2放宽至0.28，避免过于僵化
+        self.wall_threshold = 0.75         # 挂单壁比例保持不变
+        self.volume_spike_ratio = 1.5      # 成交量喷发：从2.0x降至1.5x，宽松但仍有主力介入痕迹
+        self.accel_threshold = 0.0         # 加速度：取消固定缓冲，改为简单过零即发
+        self.min_15m_rsi = 40              # 15分钟RSI上限：从35上调至40，避免错过早期反弹
 
-        # ---------- 新增过滤器参数 ----------
-        self.MIN_VOLUME_USDT = 30_000_000  # 24h成交额 ≥ 3000万 USDT
-        self.btc_waterfall_threshold = -0.05  # BTC 1小时跌幅超5%暂停
+        # ---------- 流动性门槛 ----------
+        self.MIN_VOLUME_USDT = 20_000_000  # 24h成交额 ≥ 2000万 USDT
 
-        # ---------- 系统参数 ----------
+        # ---------- 系统控制 ----------
         self.top_n_symbols = 30
         self.symbols = []
         self.last_sent = {}
         self.exchange = None
-        self.order_enabled = True
+        self.order_enabled = True          # 是否自动下单
 
     # ========== 交易所初始化 ==========
     def _init_exchange(self):
@@ -66,26 +66,19 @@ class CryptoExtremeBot:
 
     # ========== 时段权重与禁区判断 ==========
     def get_time_multiplier(self):
-        """根据当前UTC时间返回偏离度调整系数"""
         now_utc = datetime.now(timezone.utc).hour
-        # 凌晨 20:00-23:00 UTC 流动性最差，门槛提高 1.5 倍
-        if 20 <= now_utc <= 23:
-            return 1.5
-        # 美盘剧烈波动时段 (13:00-16:00 UTC) 门槛提高 1.2 倍
-        if 13 <= now_utc <= 16:
+        if 20 <= now_utc <= 23:           # 低流动性时段
+            return 1.3
+        if 13 <= now_utc <= 16:           # 美盘剧烈波动时段
             return 1.2
         return 1.0
 
     def is_in_quiet_period(self):
-        """判断当前是否处于禁止发单的静默期：
-        - 日线换线 (UTC 00:00-00:05)
-        - 资金费率结算前后 5 分钟 (UTC 00:00, 08:00, 16:00)
-        """
         now = datetime.now(timezone.utc)
-        # 换线瞬间
+        # 日线换线 (00:00-00:05)
         if now.hour == 0 and now.minute < 5:
             return True
-        # 费率结算时刻的前后5分钟
+        # 费率结算前后5分钟
         for funding_hour in [0, 8, 16]:
             start = now.replace(hour=funding_hour, minute=0, second=0, microsecond=0) - timedelta(minutes=5)
             end = now.replace(hour=funding_hour, minute=0, second=0, microsecond=0) + timedelta(minutes=5)
@@ -94,15 +87,12 @@ class CryptoExtremeBot:
         return False
 
     async def is_btc_waterfall(self):
-        """检查BTC过去1小时跌幅是否超过阈值（全局暂停）"""
         try:
             ohlcv = await self.exchange.fetch_ohlcv('BTC-USDT-SWAP', '1h', limit=1)
             if ohlcv and len(ohlcv) > 0:
-                prev_close = ohlcv[0][1]  # 开盘价
-                current_price = ohlcv[0][4]  # 收盘价
-                change = (current_price - prev_close) / prev_close
-                if change < self.btc_waterfall_threshold:
-                    print(f"⚠️ BTC 1小时跌幅 {change*100:.2f}% 超过阈值，全局暂停")
+                change = (ohlcv[0][4] - ohlcv[0][1]) / ohlcv[0][1]
+                if change < -0.05:  # 1小时跌幅超5%
+                    print(f"⚠️ BTC 1小时跌幅 {change*100:.2f}%，全局暂停")
                     return True
         except Exception as e:
             print(f"⚠️ 获取BTC瀑布信息失败: {e}")
@@ -271,20 +261,17 @@ class CryptoExtremeBot:
 
     # ========== 主扫描 ==========
     async def scan_market(self):
-        # 时段静默期检查
         if self.is_in_quiet_period():
-            print(f"⏰ [{datetime.now().strftime('%H:%M:%S')}] 当前处于静默期，跳过所有信号")
+            print(f"⏰ [{datetime.now().strftime('%H:%M:%S')}] 静默期，跳过")
             return
-
-        # BTC瀑布检查
         if await self.is_btc_waterfall():
             return
 
-        # 时间权重系数
         time_mult = self.get_time_multiplier()
-        effective_dev_threshold = self.deviation_std * time_mult
+        effective_dev = self.deviation_std * time_mult
 
-        print(f"🔄 [{datetime.now().strftime('%H:%M:%S')}] 扫描 {len(self.symbols)} 个合约 (时段系数: {time_mult}, 门槛偏离度: {effective_dev_threshold:.2f})")
+        print(f"🔄 [{datetime.now().strftime('%H:%M:%S')}] 扫描 {len(self.symbols)} 个合约 "
+              f"(时段系数:{time_mult}, 偏离度门限:{effective_dev:.2f})")
 
         for symbol in self.symbols:
             try:
@@ -292,11 +279,11 @@ class CryptoExtremeBot:
                 if data is None:
                     continue
 
-                # 1. 空间过滤（动态门槛）
-                if data['deviation'] < effective_dev_threshold:
+                # 1. 空间过滤 (动态)
+                if data['deviation'] < effective_dev:
                     continue
 
-                # 2. 振荡器钝化
+                # 2. 振荡器
                 if data['osc_score'] > self.threshold_osc:
                     continue
 
@@ -304,7 +291,7 @@ class CryptoExtremeBot:
                 if data['buy_wall'] < self.wall_threshold:
                     continue
 
-                # 4. 15分钟共振
+                # 4. 15分钟趋势
                 if data['rsi_15m'] is None or data['rsi_15m'] > self.min_15m_rsi:
                     continue
 
@@ -317,7 +304,7 @@ class CryptoExtremeBot:
                 if current_vol < self.volume_spike_ratio * avg_vol:
                     continue
 
-                # 6. 加速度确认
+                # 6. 加速度过零 (取消固定缓冲)
                 prices_1m = data['price_1m']
                 if len(prices_1m) < 5:
                     continue
@@ -327,7 +314,7 @@ class CryptoExtremeBot:
                     continue
                 curr_acc = accel[-1]
                 prev_acc = accel[-2]
-                if not (curr_acc > self.accel_threshold and prev_acc <= 0):
+                if not (curr_acc > 0 and prev_acc <= 0):   # 简单的由负转正
                     continue
 
                 # 信号生成
@@ -340,24 +327,23 @@ class CryptoExtremeBot:
                     continue
 
                 msg = (
-                    f"📈 **极端反转做多信号 (稳健版)**\n\n"
+                    f"📈 **极端反转做多信号 (平衡版)**\n\n"
                     f"🏷️ 币种: `{symbol}`\n"
                     f"💰 当前价: `{data['curr_price']}`\n"
                     f"📍 **推导买入位**: `{target_entry}`\n\n"
-                    f"📊 **过滤条件通过**:\n"
-                    f"- 偏离度: `{data['deviation']:.2f}` (≥{effective_dev_threshold:.2f}动态)\n"
+                    f"📊 **通过条件**:\n"
+                    f"- 动态偏离度: `{data['deviation']:.2f}` (≥{effective_dev:.2f})\n"
                     f"- 振荡加权: `{data['osc_score']:.2f}` (≤{self.threshold_osc})\n"
                     f"- 挂单壁: `{data['buy_wall']:.2f}` (≥{self.wall_threshold})\n"
                     f"- 15分钟RSI: `{data['rsi_15m']:.1f}` (<{self.min_15m_rsi})\n"
-                    f"- 成交量喷发: `{current_vol/avg_vol:.1f}x` (≥{self.volume_spike_ratio}x)\n"
-                    f"- 加速度: `{curr_acc:.6f}` (prev≤0, curr>{self.accel_threshold})\n\n"
+                    f"- 成交量: `{current_vol/avg_vol:.1f}x` (≥{self.volume_spike_ratio})\n"
+                    f"- 加速度过零: `{curr_acc:.6f}` (prev≤0, curr>0)\n\n"
                     f"🛑 建议止损: `{data['curr_price'] * 0.98:.6f}`"
                 )
                 success = await self.send_tg(msg)
                 if success:
                     self.last_sent[symbol] = now
                     print(f"✅ 推送 {symbol} 信号")
-
                     if self.order_enabled:
                         await self.place_limit_order(symbol, target_entry, amount=0.01)
 
@@ -374,9 +360,9 @@ class CryptoExtremeBot:
             print(f"❌ 初始化失败: {e}")
             return
 
-        await self.send_tg(f"🚀 **稳健版反转系统启动**\n"
-                           f"参数: 偏离度>{self.deviation_std}σ(动态), 振荡器<{self.threshold_osc}, "
-                           f"巨量>{self.volume_spike_ratio}x, 加速度>{self.accel_threshold}, 15mRSI<{self.min_15m_rsi}\n"
+        await self.send_tg(f"🚀 **黄金平衡版反转系统启动**\n"
+                           f"偏离度>{self.deviation_std}σ(动态) | 振荡器<{self.threshold_osc} | "
+                           f"巨量>{self.volume_spike_ratio}x | 加速度>0 | 15mRSI<{self.min_15m_rsi}\n"
                            f"最低24h成交额: {self.MIN_VOLUME_USDT/1e6}M USDT")
         while True:
             start = time.time()
